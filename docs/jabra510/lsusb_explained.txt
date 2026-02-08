@@ -1,0 +1,118 @@
+This is a detailed USB descriptor dump for a **Jabra SPEAK 510** USB speakerphone. Let me break down each section:
+
+## Device Descriptor (Lines 3-17)
+
+```
+idVendor:  0x0b0e (GN Netcom)
+idProduct: 0x0422 (Jabra SPEAK 510)
+bcdUSB:    2.00 (USB 2.0)
+Serial:    50C2ED50F625022000
+```
+
+- **Class 0**: Composite device (interfaces define actual functions)
+- **Max packet size**: 64 bytes for control endpoint
+- **Device version**: 2.32
+
+## Configuration Descriptor (Lines 18-27)
+
+```
+4 Interfaces total
+Self-powered (has own power supply)
+Max draw: 500mA
+```
+
+## Interface 0: Audio Control (Lines 28-132)
+
+This is the **control hub** for the audio topology. It defines the audio processing graph:
+
+### Audio Topology
+
+**Playback Path** (USB → Speaker):
+```
+Input Terminal (1)          ← USB streaming audio in
+    ↓
+Feature Unit (2)            ← Volume/Mute control
+    ↓
+Output Terminal (3)         → Speakerphone hardware
+```
+
+**Capture Path** (Microphone → USB):
+```
+Input Terminal (4)          ← Speakerphone mic
+    ↓
+Feature Unit (5)            ← Volume/Mute control
+    ↓
+Selector Unit (7)           ← Routing selector (1 input)
+    ↓
+Output Terminal (6)         → USB streaming audio out
+```
+
+### Key Details:
+- **Terminal Type 0x0405**: Echo-canceling speakerphone (both input/output)
+- **Playback**: 2 channels (stereo) - Left/Right front
+- **Capture**: 1 channel (mono microphone)
+- **Endpoint 0x85**: Interrupt endpoint for audio control notifications (volume changes, etc.)
+
+## Interface 1: Audio Streaming OUT (Lines 133-192)
+
+Handles **playback** (USB host → device).
+
+### Alternate Setting 0 (Lines 134-142)
+- No endpoints (idle/disabled state)
+
+### Alternate Setting 1 (Lines 143-192)
+- **Active playback configuration**
+- **Format**: PCM, 16-bit, stereo (2 channels)
+- **Sample rates**: 8 kHz, 16 kHz, 48 kHz (discrete options)
+- **Endpoint 0x03 OUT**: Isochronous, 192 bytes max packet
+  - Isochronous = guaranteed bandwidth, no retries
+  - 192 bytes @ 48 kHz stereo = 48 samples/ms
+
+## Interface 2: Audio Streaming IN (Lines 193-248)
+
+Handles **capture** (device → USB host).
+
+### Alternate Setting 0 (Lines 194-202)
+- No endpoints (idle/disabled state)
+
+### Alternate Setting 1 (Lines 203-248)
+- **Active capture configuration**
+- **Format**: PCM, 16-bit, mono (1 channel)
+- **Sample rate**: 16 kHz only (optimized for voice)
+- **Endpoint 0x83 IN**: Isochronous, 32 bytes max packet
+  - 32 bytes @ 16 kHz mono = 16 samples/ms
+
+## Interface 3: HID (Lines 249-278)
+
+**Human Interface Device** for buttons/controls.
+
+```
+HID Version: 1.11
+Report descriptor: 408 bytes (unavailable in this dump)
+Endpoint 0x81 IN: Interrupt, 16 bytes, 1ms polling
+```
+
+This handles:
+- Call control buttons (answer/hang up)
+- Volume buttons
+- Mute button
+- Possibly hook switch status
+
+The HID report descriptor (which defines button mappings) requires additional tools to view.
+
+## Summary
+
+**Endpoints used:**
+- EP0: Control (default, all devices)
+- EP1 IN: HID interrupt (buttons)
+- EP3 OUT: Audio playback (speaker)
+- EP3 IN: Audio capture (microphone)
+- EP5 IN: Audio control interrupt (volume change notifications)
+
+**Audio capabilities:**
+- **Speaker**: Stereo, 8/16/48 kHz, 16-bit
+- **Microphone**: Mono, 16 kHz, 16-bit (voice-optimized)
+- **Echo cancellation**: Built into hardware (terminal type 0x0405)
+- **Volume/Mute**: Controlled via Feature Units (2, 5)
+
+This is a typical USB Audio Class (UAC 1.0) speakerphone with added HID for telephony controls.

@@ -1,0 +1,38 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+
+# Component manager
+dependencies.lock
+/managed_components
+
+
+# IDE and editor files
+.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Cache
+.cache/
+
+# Claude Code documentation (local only)
+# CLAUDE.md
+/.claude
+error.log
+instructions.txt
+
+# Generated audio samples (built from samples-src/)
+/sons/src
+/sons/vrac
+/sons/soundboard
+
+*.log
+

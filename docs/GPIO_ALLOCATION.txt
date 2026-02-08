@@ -1,0 +1,218 @@
+ESP32-S3 GPIO Allocation for Soundboard Project
+================================================
+
+TARGET CHIP: ESP32-S3
+TOTAL GPIO PINS: 49 (GPIO0-GPIO48)
+
+
+RESERVED PINS (DO NOT USE)
+===========================
+
+GPIO19 - USB_D- (USB PHY) - RESERVED for USB OTG
+GPIO20 - USB_D+ (USB PHY) - RESERVED for USB OTG
+
+GPIO26 - SPI Flash/PSRAM - RESERVED (SPICS1)
+GPIO27 - SPI Flash/PSRAM - RESERVED (SPIHD)
+GPIO28 - SPI Flash/PSRAM - RESERVED (SPIWP)
+GPIO29 - SPI Flash/PSRAM - RESERVED (SPICS0)
+GPIO30 - SPI Flash/PSRAM - RESERVED (SPICLK)
+GPIO31 - SPI Flash/PSRAM - RESERVED (SPIQ)
+GPIO32 - SPI Flash/PSRAM - RESERVED (SPID)
+
+GPIO33 - Octal PSRAM (if present) - RESERVED
+GPIO34 - Octal PSRAM (if present) - RESERVED
+GPIO35 - Octal PSRAM (if present) - RESERVED
+GPIO36 - Octal PSRAM (if present) - RESERVED
+GPIO37 - Octal PSRAM (if present) - RESERVED
+
+GPIO43 - UART0 TXD (default) - RESERVED for console/programming
+GPIO44 - UART0 RXD (default) - RESERVED for console/programming
+
+GPIO0 - Strapping pin (boot mode) - Avoid unless necessary
+GPIO3 - Strapping pin (JTAG enable) - Avoid unless necessary
+GPIO45 - Strapping pin (VDD_SPI voltage) - Avoid unless necessary
+GPIO46 - Strapping pin (boot from SD/JTAG) - Avoid unless necessary
+
+
+ALLOCATED PINS (CURRENTLY IN USE)
+==================================
+
+I2S Audio Output (external DAC/amplifier):
+GPIO12 - I2S LRC (Word Select/Left-Right Clock) - OUTPUT
+GPIO13 - I2S BCLK (Bit Clock/Serial Clock) - OUTPUT
+GPIO14 - I2S DIN (Data Out to DAC) - OUTPUT
+GPIO47 - I2S SD (Amplifier Shutdown, active low) - OUTPUT
+
+Matrix Keypad (4x3 = 12 buttons):
+GPIO10 - Matrix Row 0 - OUTPUT (scans row 0, buttons 1-3)
+GPIO7 - Matrix Row 1 - OUTPUT (scans row 1, buttons 4-6)
+GPIO6 - Matrix Row 2 - OUTPUT (scans row 2, buttons 7-9)
+GPIO9 - Matrix Row 3 - OUTPUT (scans row 3, buttons 10-12)
+
+GPIO11 - Matrix Column 0 - INPUT with pull-up (buttons 1, 4, 7, 10)
+GPIO4 - Matrix Column 1 - INPUT with pull-up (buttons 2, 5, 8, 11)
+GPIO5 - Matrix Column 2 - INPUT with pull-up (buttons 3, 6, 9, 12)
+
+Display (SSD1306 OLED via I2C):
+GPIO8 - Display I2C SDA - OUTPUT (I2C data line)
+GPIO18 - Display I2C SCL - OUTPUT (I2C clock line)
+
+SD Card (SPI interface):
+GPIO42 - SD Card CS (Chip Select) - OUTPUT (SPI)
+GPIO41 - SD Card MOSI (Master Out) - OUTPUT (SPI)
+GPIO40 - SD Card CLK (Clock) - OUTPUT (SPI)
+GPIO39 - SD Card MISO (Master In) - INPUT (SPI)
+
+Rotary Encoder (volume control):
+GPIO15 - Rotary Encoder CLK (clock/channel A) - INPUT (quadrature)
+GPIO16 - Rotary Encoder DT (data/channel B) - INPUT (quadrature)
+GPIO17 - Rotary Encoder SW (switch/button) - INPUT (optional push button)
+
+GPIO48 - RGB led on dev board
+
+
+
+FREE PINS (AVAILABLE FOR EXPANSION)
+====================================
+
+GPIO1 - Free (ADC1_CH0, TOUCH1)
+GPIO2 - Free (ADC1_CH1, TOUCH2)
+
+GPIO21 - Free
+
+GPIO38 - Free
+
+
+PIN NOTES AND RECOMMENDATIONS
+==============================
+
+Safe pins for general GPIO (tested and reliable):
+- GPIO1, GPIO2, GPIO21, GPIO38
+
+Pins with pull-up resistors by default:
+- GPIO43, GPIO44 (UART0 pins)
+
+Pins that can be used but require care:
+- GPIO0: Boot button (requires LOW during boot for download mode)
+- GPIO3: JTAG enable (usually HIGH by default)
+- GPIO45, GPIO46: Strapping pins (check boot requirements)
+
+Analog-capable pins (ADC1):
+- GPIO1 (ADC1_CH0), GPIO2 (ADC1_CH1), GPIO3 (ADC1_CH2), GPIO4 (ADC1_CH3)
+- GPIO5 (ADC1_CH4), GPIO6 (ADC1_CH5), GPIO7 (ADC1_CH6), GPIO8 (ADC1_CH7)
+- GPIO9 (ADC1_CH8), GPIO10 (ADC1_CH9)
+
+Analog-capable pins (ADC2):
+- GPIO11 (ADC2_CH0), GPIO12 (ADC2_CH1), GPIO13 (ADC2_CH2), GPIO14 (ADC2_CH3)
+- GPIO15 (ADC2_CH4), GPIO16 (ADC2_CH5), GPIO17 (ADC2_CH6), GPIO18 (ADC2_CH7)
+- GPIO19 (ADC2_CH8) - but RESERVED for USB
+- GPIO20 (ADC2_CH9) - but RESERVED for USB
+
+Touch sensor pins:
+- GPIO1 to GPIO14 (TOUCH1 to TOUCH14)
+
+
+HARDWARE CONFIGURATION SOURCES
+================================
+
+Configuration defined in:
+- main/Kconfig.projbuild (Kconfig defaults)
+- sdkconfig (active configuration)
+- mappings.csv (button-to-sound mapping, user-editable)
+
+Default GPIO assignments (from Kconfig.projbuild):
+
+I2S Audio Output:
+- LRC (Word Select): GPIO12
+- BCLK (Bit Clock): GPIO13
+- DIN (Data Out): GPIO14
+- SD (Shutdown): GPIO47
+
+Matrix keypad (4x3):
+- Row GPIOs: GPIO10, GPIO7, GPIO6, GPIO9
+- Column GPIOs: GPIO11, GPIO4, GPIO5
+- Scan interval: 5ms
+- Debounce press: 10ms
+- Debounce release: 50ms
+- Long-press threshold: 1000ms
+
+SD Card (SPI):
+- MOSI: GPIO41
+- MISO: GPIO39
+- CLK: GPIO40
+- CS: GPIO42
+
+Display (I2C):
+- SDA: GPIO8
+- SCL: GPIO18
+- Address: 0x3C
+- Frequency: 100kHz
+
+Rotary Encoder:
+- CLK: GPIO15
+- DT: GPIO16
+- SW: GPIO17
+- Debounce time: 5ms
+
+
+EXPANSION SUGGESTIONS
+=====================
+
+Additional individual buttons:
+- Use GPIO1, GPIO2, GPIO21, GPIO38
+- Add external RC filter (10kΩ + 220nF) for each button
+- Configure via Kconfig or add to matrix
+
+Larger matrix keypads:
+- Current: 4x3 (12 buttons using 7 GPIOs)
+- 5x4 (20 buttons): Add 1 row + 1 column GPIO
+- 6x5 (30 buttons): Add 2 rows + 2 columns GPIOs
+
+Additional encoders:
+- GPIO pairs: (GPIO1, GPIO2), (GPIO38, GPIO21)
+- Each encoder needs 2 GPIO for quadrature + optional 1 for switch
+
+I2C sensors/peripherals:
+- Share GPIO8 (SDA) and GPIO18 (SCL) with display
+- Use different I2C address (display is 0x3C)
+
+SPI peripherals:
+- Can share MOSI/MISO/CLK with SD card (GPIO40, GPIO41, GPIO39)
+- Need separate CS pin (use any free GPIO)
+
+PWM outputs (LED control, etc.):
+- Any free GPIO can be used for LEDC PWM
+- Recommended: GPIO1, GPIO2, GPIO21, GPIO38
+
+
+PROJECT ARCHITECTURE NOTES
+============================
+
+Input handling: main/core/input_scanner.c
+- Unified polling-based input for matrix keypad and rotary encoder
+- Single FreeRTOS task (5ms scan interval)
+- Matrix: 4x3 keypad with per-button debouncing (10ms press, 50ms release)
+- Encoder: Quadrature decoding with Gray code state machine (5ms debounce)
+- Events: PRESS, LONG_PRESS, RELEASE, ROTATE_CW, ROTATE_CCW, SW_*
+
+Configuration system: main/uac/mapper.c
+- Synchronous mapper v2.1 with direct callback execution
+- String page IDs, circular page switching
+- 10 action types: play, play_cut, loop, autofire, autofire_cut, timed, stop, volume_*
+- Button numbering: 1-12 (row-major order)
+
+Audio output: I2S with external DAC
+- GPIO12 (LRC), GPIO13 (BCLK), GPIO14 (DIN), GPIO47 (SD/shutdown)
+- Player task with audio_provider abstraction layer
+- PSRAM caching with LRU eviction
+
+USB Host: main/main.c, main/msc/
+- MSC class for file sync from USB flash drive
+- GPIO19 (D-) and GPIO20 (D+) reserved for USB PHY
+
+
+LAST UPDATED
+=============
+2026-01-28
+ESP-IDF Version: v6.0
+Configuration: I2S audio output, matrix keypad (4x3), rotary encoder, SD card, OLED display

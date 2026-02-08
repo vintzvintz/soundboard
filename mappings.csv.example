@@ -1,0 +1,99 @@
+# Soundboard Mappings v3 - Example Configuration
+# Format: page_id,button,event,action[,param1]
+# Trailing columns are optional (no trailing commas needed)
+#
+# Page IDs: String identifiers (max 31 chars), e.g., "default", "fx", "music"
+#           First page loaded becomes the active page on startup.
+#           Encoder switch toggles between VOLUME and PAGE modes.
+#           In PAGE mode, encoder rotation cycles through pages.
+#
+# Action types and parameters:
+# - stop: No parameters
+# - play: file (play once until EOF)
+# - play_cut: file (play once, stop on RELEASE)
+# - play_lock: file (press=play with stop on release, long_press=lock)
+#
+# Button Layout (4x3 matrix, row-major numbering):
+#   +---+---+---+
+#   |10 |11 |12 |  Row 3
+#   +---+---+---+
+#   | 7 | 8 | 9 |  Row 2
+#   +---+---+---+
+#   | 4 | 5 | 6 |  Row 1
+#   +---+---+---+
+#   | 1 | 2 | 3 |  Row 0
+#   +---+---+---+
+#
+# Event types: press, long_press, release
+# Volume: Controlled via rotary encoder (not mappable to buttons)
+# Encoder: Short press toggles VOLUME/PAGE mode. Rotation adjusts volume or changes page.
+
+# ============================================================================
+# Page "default": Sound Effects & Basic Actions
+# ============================================================================
+
+# Button 1: Simple laser sound (plays once, no interrupt)
+default,1,press,play,laser.wav
+
+# Button 2: Explosion with auto-stop on release
+default,2,press,play_cut,explosion.wav
+
+# Button 3: Gunshot with play_lock behavior
+# Quick press+release: plays then stops (like play_cut)
+# Hold past long_press threshold then release: keeps playing (locked)
+# Press again while locked: stops playback
+default,3,press,play_lock,gunshot.wav
+
+# Button 4: Siren with play_lock
+default,4,press,play_lock,siren.wav
+
+# Button 5: Alarm sound
+default,5,press,play,alarm.wav
+
+# Button 6: Background music with play_lock (hold to lock, press again to stop)
+default,6,press,play_lock,background_music.wav
+
+# Button 7: Jingle (play once)
+default,7,press,play,jingle.wav
+
+# Button 8: Simple beep
+default,8,press,play,beep.wav
+
+# Button 9: Multi-action button (different sounds for press vs long_press)
+default,9,press,play,short_alert.wav
+default,9,long_press,play,long_alarm.wav
+
+# Button 10: Horn (play while held)
+default,10,press,play_cut,horn.wav
+
+# Button 11: Whoosh sound
+default,11,press,play,whoosh.wav
+
+# Button 12: Stop playback
+default,12,press,stop
+
+# ============================================================================
+# Page "music": Music tracks (switch to this page via encoder)
+# ============================================================================
+
+music,1,press,play_lock,song1.wav
+music,2,press,play_lock,song2.wav
+music,3,press,play_lock,song3.wav
+
+# Voice clips on same page
+music,4,press,play,voice1.wav
+music,5,press,play,voice2.wav
+music,6,press,play,voice3.wav
+
+# ============================================================================
+# Notes:
+# ============================================================================
+# - Page IDs are strings (e.g., "default", "music", "fx") - max 31 characters
+# - First page in file becomes active on startup
+# - Encoder switch short press: toggles between VOLUME and PAGE modes
+# - In PAGE mode, encoder rotation cycles through pages (circular)
+# - Button release events: Automatically handled for play_cut and play_lock
+# - play_lock: long_press while playing locks playback (implicit, no CSV mapping needed)
+# - Multiple mappings per button: Use different events (press, long_press, release)
+# - Audio files: Place WAV files in /sdcard/ or /spiffs/ directories
+# - Relative paths (without leading /) are auto-prefixed with /sdcard/

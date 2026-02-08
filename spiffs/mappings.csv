@@ -1,0 +1,16 @@
+# Event Mappings Configuration (Development)
+# This file is in SPIFFS and will be updated when you flash the firmware
+
+# Example mappings for buttons 1-12 with press events
+Base,1,press,play,bullshit.wav
+Base,2,press,play,oui.wav
+Base,3,press,play,non.wav
+Base,4,press,play,bullshit.wav
+Base,5,press,play,oui.wav
+Base,6,press,play,non.wav
+Base,7,press,play,bullshit.wav
+Base,8,press,play,oui.wav
+Base,9,press,play,non.wav
+Base,10,press,play,startup.wav
+Base,11,press,play,startup.wav
+Base,12,press,play,startup.wav

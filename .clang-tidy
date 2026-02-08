@@ -1,0 +1,40 @@
+---
+# clang-tidy configuration for ESP-IDF projects
+# Run with: idf.py clang-check
+
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  concurrency-*,
+  -concurrency-mt-unsafe,
+  performance-*,
+  portability-*,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  misc-*,
+  -misc-unused-parameters,
+  -misc-no-recursion
+
+WarningsAsErrors: ''
+
+CheckOptions:
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.EnumConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.StructCase
+    value: lower_case
+  - key: readability-braces-around-statements.ShortStatementLines
+    value: '1'
+  - key: performance-move-const-arg.CheckTriviallyCopyableMove
+    value: '0'
+
+HeaderFilterRegex: '.*'
+FormatStyle: file

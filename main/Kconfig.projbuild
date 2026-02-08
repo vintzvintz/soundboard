@@ -1,0 +1,359 @@
+menu "Soundboard Application"
+
+    menu "I2S Audio Output Configuration"
+        config SOUNDBOARD_I2S_LRC_GPIO
+            int "I2S LRC (Word Select) GPIO Pin"
+            default 12
+            range 0 48
+            help
+                GPIO pin for I2S LRC (Left/Right Clock, also called Word Select or WS).
+                This signal indicates which channel (left or right) is being transmitted.
+
+                Default: GPIO 12
+
+        config SOUNDBOARD_I2S_BCLK_GPIO
+            int "I2S BCLK (Bit Clock) GPIO Pin"
+            default 13
+            range 0 48
+            help
+                GPIO pin for I2S BCLK (Bit Clock, also called SCK or Serial Clock).
+                This is the clock signal for data transmission.
+
+                Default: GPIO 13
+
+        config SOUNDBOARD_I2S_DIN_GPIO
+            int "I2S DIN (Data Out) GPIO Pin"
+            default 14
+            range 0 48
+            help
+                GPIO pin for I2S DIN (Data Input to the DAC, also called DOUT from ESP32 perspective).
+                This carries the serial audio data.
+
+                Default: GPIO 14
+
+        config SOUNDBOARD_I2S_SD_GPIO
+            int "I2S SD (Shutdown) GPIO Pin"
+            default 47
+            range -1 48
+            help
+                GPIO pin for I2S amplifier shutdown control (active low on most modules).
+                Set to -1 to disable if your module does not have this pin.
+
+                When enabled, this pin is set HIGH to enable the amplifier
+                and LOW to put it in shutdown/mute mode.
+
+                Default: GPIO 47
+    endmenu
+
+    menu "SD Card Configuration"
+        config SOUNDBOARD_SD_MOSI_GPIO
+            int "SD Card MOSI GPIO Pin"
+            default 41
+            range 0 48
+            help
+                GPIO pin for SD card SPI MOSI (Master Out Slave In).
+                Default: GPIO 41
+
+        config SOUNDBOARD_SD_MISO_GPIO
+            int "SD Card MISO GPIO Pin"
+            default 39
+            range 0 48
+            help
+                GPIO pin for SD card SPI MISO (Master In Slave Out).
+                Default: GPIO 39
+
+        config SOUNDBOARD_SD_CLK_GPIO
+            int "SD Card CLK GPIO Pin"
+            default 40
+            range 0 48
+            help
+                GPIO pin for SD card SPI clock.
+                Default: GPIO 40
+
+        config SOUNDBOARD_SD_CS_GPIO
+            int "SD Card CS GPIO Pin"
+            default 42
+            range 0 48
+            help
+                GPIO pin for SD card SPI chip select.
+                Default: GPIO 42
+    endmenu
+
+    menu "OLED Display Configuration"
+        config SOUNDBOARD_DISPLAY_SDA_GPIO
+            int "Display I2C SDA GPIO Pin"
+            default 8
+            range 0 48
+            help
+                GPIO pin number for I2C SDA (data line) connected to the display.
+
+                Default: GPIO 8
+
+        config SOUNDBOARD_DISPLAY_SCL_GPIO
+            int "Display I2C SCL GPIO Pin"
+            default 18
+            range 0 48
+            help
+                GPIO pin number for I2C SCL (clock line) connected to the display.
+
+                Default: GPIO 18
+        config SOUNDBOARD_DISPLAY_I2C_ADDR
+            hex "Display I2C Address"
+            default 0x3C
+            help
+                I2C address of the SSD1306 OLED display.
+
+                Common addresses: 0x3C or 0x3D
+                Default: 0x3C
+
+        config SOUNDBOARD_DISPLAY_I2C_FREQ
+            int "Display I2C Frequency (Hz)"
+            default 400000
+            range 10000 1000000
+            help
+                I2C bus clock frequency in Hz for communication with the display.
+
+                Standard speeds:
+                - 100000 (100 kHz) - Standard mode
+                - 400000 (400 kHz) - Fast mode (recommended)
+                - 1000000 (1 MHz) - Fast mode plus
+
+                Default: 400000 Hz (400 kHz)
+
+    endmenu
+
+    menu "User interface settings"
+
+        config SOUNDBOARD_MATRIX_SCAN_INTERVAL_MS
+            int "Matrix scan interval (ms)"
+            default 5
+            range 1 50
+            help
+                Time between matrix scans in milliseconds.
+
+                Smaller values = faster response, higher CPU usage
+                Larger values = slower response, lower CPU usage
+
+                Default: 5 ms (good balance)
+
+        menu "Rotary encoder"
+            config SOUNDBOARD_ENCODER_CLK_GPIO
+                int "Encoder CLK (Clock/Channel A) GPIO Pin"
+                default 15
+                range 0 48
+                help
+                    GPIO pin connected to the encoder CLK line (quadrature channel A).
+
+                    This is one of two signal pins used for rotation detection.
+                    Default: GPIO 15
+
+            config SOUNDBOARD_ENCODER_DT_GPIO
+                int "Encoder DT (Data/Channel B) GPIO Pin"
+                default 16
+                range 0 48
+                help
+                    GPIO pin connected to the encoder DT line (quadrature channel B).
+
+                    This is the second signal pin used for rotation detection.
+                    Default: GPIO 16
+
+            config SOUNDBOARD_ENCODER_SW_GPIO
+                int "Encoder SW (Switch/Button) GPIO Pin"
+                default 17
+                range -1 48
+                help
+                    GPIO pin for the built-in push button switch (optional).
+
+                    Many rotary encoders have an integrated push button that can be
+                    pressed by pushing down on the knob. Set to -1 to disable if your
+                    encoder does not have this feature.
+
+                    Default: GPIO 17
+
+            config SOUNDBOARD_ENCODER_DEBOUNCE_MS
+                int "Encoder Debounce Time (ms)"
+                default 5
+                range 1 20
+                help
+                    Debounce time for encoder signal transitions in milliseconds.
+
+                    Rotary encoders have mechanical contacts that can bounce during
+                    rotation. This setting filters out transitions that occur faster
+                    than the specified time.
+
+                    Smaller values = faster response, larger = more stable
+                    Typical range: 2-5ms for good quality encoders
+
+                    Default: 5 ms
+        endmenu
+
+        menu "Keypad matrix"
+            menu "Matrix Row GPIOs"
+                config SOUNDBOARD_MATRIX_ROW_GPIO_0
+                    int "Row 0 GPIO"
+                    default 10
+                    range 0 48
+                    help
+                        GPIO pin for matrix row 0 (first row).
+                        Configured as output to scan the matrix.
+
+                config SOUNDBOARD_MATRIX_ROW_GPIO_1
+                    int "Row 1 GPIO"
+                    default 7
+                    range 0 48
+                    help
+                        GPIO pin for matrix row 1.
+                        Configured as output to scan the matrix.
+
+                config SOUNDBOARD_MATRIX_ROW_GPIO_2
+                    int "Row 2 GPIO"
+                    default 6
+                    range 0 48
+                    help
+                        GPIO pin for matrix row 2.
+                        Configured as output to scan the matrix.
+
+                config SOUNDBOARD_MATRIX_ROW_GPIO_3
+                    int "Row 3 GPIO"
+                    default 9
+                    range 0 48
+                    help
+                        GPIO pin for matrix row 3 (last row).
+                        Configured as output to scan the matrix.
+            endmenu
+
+            menu "Matrix Column GPIOs"
+                config SOUNDBOARD_MATRIX_COL_GPIO_0
+                    int "Column 0 GPIO"
+                    default 11
+                    range 0 48
+                    help
+                        GPIO pin for matrix column 0 (first column).
+                        Configured as input with pull-up.
+
+                config SOUNDBOARD_MATRIX_COL_GPIO_1
+                    int "Column 1 GPIO"
+                    default 4
+                    range 0 48
+                    help
+                        GPIO pin for matrix column 1.
+                        Configured as input with pull-up.
+
+                config SOUNDBOARD_MATRIX_COL_GPIO_2
+                    int "Column 2 GPIO"
+                    default 5
+                    range 0 48
+                    help
+                        GPIO pin for matrix column 2 (last column).
+                        Configured as input with pull-up.
+            endmenu
+
+
+            config SOUNDBOARD_MATRIX_DEBOUNCE_PRESS_MS
+                int "Matrix button press debounce time (ms)"
+                default 10
+                range 1 100
+                help
+                    Debounce time for detecting button press events in milliseconds.
+
+                    Shorter debounce for press events provides faster response time.
+                    Default: 10 ms
+
+            config SOUNDBOARD_MATRIX_DEBOUNCE_RELEASE_MS
+                int "Matrix button release debounce time (ms)"
+                default 50
+                range 5 200
+                help
+                    Debounce time for detecting button release events in milliseconds.
+
+                    Longer debounce for release events helps filter out mechanical
+                    bounce that can persist longer during button release.
+                    Default: 50 ms
+
+            config SOUNDBOARD_MATRIX_LONG_PRESS_MS
+                int "Matrix long press threshold (ms)"
+                default 1000
+                range 500 5000
+                help
+                    Time threshold for detecting long press events in milliseconds.
+
+                    Default: 1000 ms (1 second)
+        endmenu
+    endmenu
+
+    menu "Storage Paths Configuration"
+        config SOUNDBOARD_MSC_ROOT_DIR
+            string "MSC device soundboard directory"
+            default "soundboard"
+            help
+                Directory name on the USB flash drive (MSC device) where
+                soundboard configuration and audio files are located.
+
+                The MSC sync workflow looks for mappings and WAV files
+                in this directory on the connected USB flash drive, then
+                copies them to the SD card root.
+
+                Example: If set to "soundboard", files will be read from
+                /soundboard/ on the USB flash drive (mounted at /msc/soundboard/).
+
+                Default: soundboard
+
+        config SOUNDBOARD_MAPPINGS_FILENAME
+            string "Mappings configuration filename"
+            default "mappings.csv"
+            help
+                Filename of the button-to-sound mappings configuration file.
+
+                This filename is used on both the MSC device (USB flash drive)
+                and the SD card. When syncing from MSC to SD card, the file
+                is copied with the same name.
+
+                Note: The SPIFFS firmware fallback mappings file is hardcoded as
+                "mappings.csv" and does not use this setting.
+
+                Default: mappings.csv
+    endmenu
+
+    menu "Player Configuration"
+        config SOUNDBOARD_PLAYER_CACHE_SIZE_KB
+            int "Audio cache size in PSRAM (KB)"
+            default 4096
+            range 0 8192
+            help
+                Size of the PSRAM cache for audio files in kilobytes.
+
+                When set to 0, caching is disabled and all audio is streamed
+                directly from storage (SD card or SPIFFS).
+
+                When enabled (>0):
+                - Frequently played audio files are cached in PSRAM
+                - Reduces SD card access and improves playback latency
+                - Uses LRU eviction when cache is full
+                - Requires PSRAM to be available
+
+                Typical values:
+                - 512 KB: ~10 seconds of 16-bit stereo @ 48kHz
+                - 1024 KB (1 MB): ~20 seconds of audio (recommended)
+                - 2048 KB (2 MB): ~40 seconds of audio
+
+                Default: 1024 KB
+
+        config SOUNDBOARD_PLAYER_FILENAME_MAX_LENGTH
+            int "Maximum audio filename length (bytes)"
+            default 192
+            range 64 512
+            help
+                Maximum length of audio file paths including null terminator.
+
+                This limits the size of filename buffers in the player module.
+                Must be large enough to accommodate full paths like:
+                /sdcard/subfolder/my_very_long_audio_file_name.wav
+
+                Typical values:
+                - 128: Short filenames only
+                - 256: Standard (recommended)
+                - 512: Very long paths with deep folder structures
+
+                Default: 256 bytes
+    endmenu
+endmenu

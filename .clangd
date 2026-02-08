@@ -1,0 +1,26 @@
+CompileFlags:
+  Remove:
+    - "-mlongcalls"
+    - "-fno-shrink-wrap"
+    - "-fstrict-volatile-bitfields"
+    - "-fno-tree-switch-conversion"
+    - "-fzero-init-padding-bits=all"
+    - "-fno-malloc-dce"
+    - "-mdisable-hardware-atomics"
+    - "-specs=picolibc.specs"
+  Add:
+    - "-D__XTENSA__"
+    - "--sysroot=/home/vintz/.espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/xtensa-esp-elf"
+    - "-isystem/home/vintz/.espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/picolibc/include"
+    - "-isystem/home/vintz/.espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/xtensa-esp-elf/sys-include"
+    - "-isystem/home/vintz/.espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/xtensa-esp-elf/include"
+  CompilationDatabase: build/
+
+Diagnostics:
+  Suppress:
+    - implicit-int-conversion
+    - implicit-int-float-conversion
+  ClangTidy:
+    Remove:
+      - readability-implicit-bool-conversion
+      - misc-use-anonymous-namespace

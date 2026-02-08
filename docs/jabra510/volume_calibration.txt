@@ -1,0 +1,17 @@
+Calibration complete! Discovered 12 discrete volume levels:
+Index dB         Raw       
+----------------------------------------
+0     -19.60     0xEC66
+1     -10.06     0xF5F1
+2     -5.62      0xFA61
+3     -2.70      0xFD4D
+4     -0.52      0xFF7C
+5     1.22       0x0139
+6     2.67       0x02AC
+7     3.91       0x03EA
+8     5.00       0x0501
+9     5.97       0x05F8
+10    6.84       0x06D7
+11    7.63       0x07A1
+----------------------------------------
+Total levels: 12
