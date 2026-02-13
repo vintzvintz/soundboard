@@ -1,6 +1,7 @@
 # Build source list
 set(COMPONENT_SRCS
     main.c
+    benchmark.c
     core/input_scanner.c
     core/sd_card.c
     core/console.c

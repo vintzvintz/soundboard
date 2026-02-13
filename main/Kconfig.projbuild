@@ -79,62 +79,21 @@ menu "Soundboard Application"
                 Default: GPIO 42
     endmenu
 
-    menu "OLED Display Configuration"
-        config SOUNDBOARD_DISPLAY_SDA_GPIO
-            int "Display I2C SDA GPIO Pin"
-            default 8
-            range 0 48
-            help
-                GPIO pin number for I2C SDA (data line) connected to the display.
-
-                Default: GPIO 8
-
-        config SOUNDBOARD_DISPLAY_SCL_GPIO
-            int "Display I2C SCL GPIO Pin"
-            default 18
-            range 0 48
-            help
-                GPIO pin number for I2C SCL (clock line) connected to the display.
-
-                Default: GPIO 18
-        config SOUNDBOARD_DISPLAY_I2C_ADDR
-            hex "Display I2C Address"
-            default 0x3C
-            help
-                I2C address of the SSD1306 OLED display.
-
-                Common addresses: 0x3C or 0x3D
-                Default: 0x3C
-
-        config SOUNDBOARD_DISPLAY_I2C_FREQ
-            int "Display I2C Frequency (Hz)"
-            default 400000
-            range 10000 1000000
-            help
-                I2C bus clock frequency in Hz for communication with the display.
-
-                Standard speeds:
-                - 100000 (100 kHz) - Standard mode
-                - 400000 (400 kHz) - Fast mode (recommended)
-                - 1000000 (1 MHz) - Fast mode plus
-
-                Default: 400000 Hz (400 kHz)
-
-    endmenu
 
     menu "User interface settings"
 
+
         config SOUNDBOARD_MATRIX_SCAN_INTERVAL_MS
             int "Matrix scan interval (ms)"
-            default 5
-            range 1 50
+            default 3
+            range 1 20
             help
                 Time between matrix scans in milliseconds.
 
                 Smaller values = faster response, higher CPU usage
                 Larger values = slower response, lower CPU usage
 
-                Default: 5 ms (good balance)
+                Default: 3 ms (good encoder tracking)
 
         menu "Rotary encoder"
             config SOUNDBOARD_ENCODER_CLK_GPIO
@@ -172,7 +131,7 @@ menu "Soundboard Application"
 
             config SOUNDBOARD_ENCODER_DEBOUNCE_MS
                 int "Encoder Debounce Time (ms)"
-                default 5
+                default 7
                 range 1 20
                 help
                     Debounce time for encoder signal transitions in milliseconds.
@@ -181,10 +140,10 @@ menu "Soundboard Application"
                     rotation. This setting filters out transitions that occur faster
                     than the specified time.
 
+                    Should be at least 2x the scan interval for effective filtering.
                     Smaller values = faster response, larger = more stable
-                    Typical range: 2-5ms for good quality encoders
 
-                    Default: 5 ms
+                    Default: 7 ms (~2-3 scan cycles at 3ms interval)
         endmenu
 
         menu "Keypad matrix"
@@ -251,24 +210,25 @@ menu "Soundboard Application"
 
             config SOUNDBOARD_MATRIX_DEBOUNCE_PRESS_MS
                 int "Matrix button press debounce time (ms)"
-                default 10
-                range 1 100
+                default 9
+                range 3 100
                 help
                     Debounce time for detecting button press events in milliseconds.
 
+                    Should span at least 3 scan cycles for reliable filtering.
                     Shorter debounce for press events provides faster response time.
-                    Default: 10 ms
+                    Default: 9 ms (3 scan cycles at 3ms interval)
 
             config SOUNDBOARD_MATRIX_DEBOUNCE_RELEASE_MS
                 int "Matrix button release debounce time (ms)"
-                default 50
+                default 30
                 range 5 200
                 help
                     Debounce time for detecting button release events in milliseconds.
 
                     Longer debounce for release events helps filter out mechanical
                     bounce that can persist longer during button release.
-                    Default: 50 ms
+                    Default: 30 ms (10 scan cycles at 3ms interval)
 
             config SOUNDBOARD_MATRIX_LONG_PRESS_MS
                 int "Matrix long press threshold (ms)"
@@ -279,9 +239,60 @@ menu "Soundboard Application"
 
                     Default: 1000 ms (1 second)
         endmenu
+
+        menu "OLED Display Configuration"
+            config SOUNDBOARD_DISPLAY_SDA_GPIO
+                int "Display I2C SDA GPIO Pin"
+                default 8
+                range 0 48
+                help
+                    GPIO pin number for I2C SDA (data line) connected to the display.
+
+                    Default: GPIO 8
+
+            config SOUNDBOARD_DISPLAY_SCL_GPIO
+                int "Display I2C SCL GPIO Pin"
+                default 18
+                range 0 48
+                help
+                    GPIO pin number for I2C SCL (clock line) connected to the display.
+
+                    Default: GPIO 18
+            config SOUNDBOARD_DISPLAY_I2C_ADDR
+                hex "Display I2C Address"
+                default 0x3C
+                help
+                    I2C address of the SSD1306 OLED display.
+
+                    Common addresses: 0x3C or 0x3D
+                    Default: 0x3C
+
+            config SOUNDBOARD_DISPLAY_I2C_FREQ
+                int "Display I2C Frequency (Hz)"
+                default 400000
+                range 10000 1000000
+                help
+                    I2C bus clock frequency in Hz for communication with the display.
+
+                    Standard speeds:
+                    - 100000 (100 kHz) - Standard mode
+                    - 400000 (400 kHz) - Fast mode (recommended)
+                    - 1000000 (1 MHz) - Fast mode plus
+
+                    Default: 400000 Hz (400 kHz)
+        endmenu
+
     endmenu
 
-    menu "Storage Paths Configuration"
+    menu "Application settings"
+        config SOUNDBOARD_IO_STATS_ENABLE
+            bool "Enable I/O runtime stats"
+            default y
+            help
+                Collect I/O performance data of sdcard, psram and USB-MSC transfers
+
+                Default: enabled
+
         config SOUNDBOARD_MSC_ROOT_DIR
             string "MSC device soundboard directory"
             default "soundboard"
@@ -312,12 +323,10 @@ menu "Soundboard Application"
                 "mappings.csv" and does not use this setting.
 
                 Default: mappings.csv
-    endmenu
 
-    menu "Player Configuration"
         config SOUNDBOARD_PLAYER_CACHE_SIZE_KB
             int "Audio cache size in PSRAM (KB)"
-            default 4096
+            default 8192
             range 0 8192
             help
                 Size of the PSRAM cache for audio files in kilobytes.
@@ -338,22 +347,5 @@ menu "Soundboard Application"
 
                 Default: 1024 KB
 
-        config SOUNDBOARD_PLAYER_FILENAME_MAX_LENGTH
-            int "Maximum audio filename length (bytes)"
-            default 192
-            range 64 512
-            help
-                Maximum length of audio file paths including null terminator.
-
-                This limits the size of filename buffers in the player module.
-                Must be large enough to accommodate full paths like:
-                /sdcard/subfolder/my_very_long_audio_file_name.wav
-
-                Typical values:
-                - 128: Short filenames only
-                - 256: Standard (recommended)
-                - 512: Very long paths with deep folder structures
-
-                Default: 256 bytes
     endmenu
 endmenu

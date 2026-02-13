@@ -5,24 +5,27 @@
  */
 
 
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"  // IWYU pragma: keep
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "player.h"
 #include "provider.h"
 #include "persistent_volume.h"
 
+#ifdef CONFIG_SOUNDBOARD_IO_STATS_ENABLE
+    #include "benchmark.h"
+#endif
+
 static const char *TAG = "player";
 
-// hardcoded to avoid including soundboard.h just for SPIFFS_MOUNT_POINT
-// DISABLED do not delete
-//static const char *STARTUP_SOUND = "/spiffs/startup.wav";
-
-// Player task configuration (hardcoded)
+// Player task configuration
 #define PLAYER_TASK_PRIORITY        2       // Run between input scanner (3) and idle (0)
 #define PLAYER_TASK_STACK_SIZE      8192    // Sufficient for file I/O, decoding, I2S transfers
 #define PLAYER_TASK_CORE_ID         1       // Pin to core 1 (APP_CPU) for real-time audio
+#define PLAYER_CMD_QUEUE_DEPTH      10      // Command queue depth (PLAY/STOP commands)
 
 // I2S DMA buffer architecture (ESP-IDF I2S_CHANNEL_DEFAULT_CONFIG):
 //   dma_desc_num  = 6    -- number of DMA descriptors (ring buffer of 6 slots)
@@ -90,7 +93,7 @@ typedef struct {
     player_cmd_type_t type;
     union {
         struct {
-            char filename[256];
+            char filename[SOUNDBOARD_MAX_PATH_LEN];
         } play;
         struct {
             bool interrupt_now;  /* true=stop playing as fast as possible. false= stop loop timer and finish playing current sample*/
@@ -111,11 +114,11 @@ typedef struct player_s {
     // i2s channel handle (from I2S driver)
     i2s_chan_handle_t i2s_channel;
     
-    // streaming permanent ressources
+    // Streaming resources (persistent)
     audio_provider_handle_t provider;
-    int16_t *pcm_buf;       // buffer between audio_provider and uac_host_write
+    int16_t *pcm_buf;       // buffer between audio_provider and i2s_channel_write
 
-    // temporary ressources (NULL when not playing)
+    // Stream resources (NULL when not playing)
     audio_stream_handle_t stream;
 
     // callback to notify player state changes event to other modules (e.g. display)
@@ -134,22 +137,96 @@ typedef struct player_s {
 
     // Progress reporting (time-throttled to avoid display queue flood)
     TickType_t last_progress_tick;    // Last tick when progress was sent
-    char current_filename[256];       // Filename of current stream (for progress events)
+    char current_filename[SOUNDBOARD_MAX_PATH_LEN]; // Filename of current stream (for progress events)
 
 } player_state_t;
 
 
+/* -------------------------------------------------------------------------
+ * Event callback helpers
+ * ------------------------------------------------------------------------- */
+
 /**
- * @brief Apply software volume scaling to PCM samples in-place
+ * @brief Fire a close-stream event (STOPPED or ERROR)
  *
- * Scales 16-bit PCM samples using fixed-point multiplication.
- * Factor 65536 = unity (0dB), factor 0 = mute. Logarithmic curve
- * via lookup table provides perceptually uniform volume steps.
- *
- * @param buffer PCM sample buffer (modified in-place)
- * @param sample_count Number of samples in buffer
- * @param factor Volume scaling factor (0-65536)
+ * For ERROR events, carries the error code.
+ * For STOPPED events, the filename field is set to NULL.
  */
+static void fire_event_close(player_state_t *player, player_event_name_t event, esp_err_t error_code)
+{
+    if (player->event_cb == NULL) {
+        return;
+    }
+    player_event_data_t data = { .name = event };
+    if (event == PLAYER_EVENT_ERROR) {
+        data.error_code = error_code;
+    } else {
+        data.filename = NULL;
+    }
+    player->event_cb(&data, player->event_cb_ctx);
+}
+
+/**
+ * @brief Fire PLAYER_EVENT_STARTED with the filename being played
+ */
+static void fire_event_started(player_state_t *player, const char *filename)
+{
+    if (player->event_cb == NULL) {
+        return;
+    }
+    player_event_data_t data = {
+        .name = PLAYER_EVENT_STARTED,
+        .filename = filename,
+    };
+    player->event_cb(&data, player->event_cb_ctx);
+}
+
+/**
+ * @brief Fire PLAYER_EVENT_PROGRESS (throttled to ~20 updates/sec)
+ *
+ * Skips the callback if less than 50ms elapsed since the last progress event,
+ * to avoid flooding the display queue.
+ */
+static void fire_event_progress(player_state_t *player)
+{
+    if (player->event_cb == NULL) {
+        return;
+    }
+    TickType_t now = xTaskGetTickCount();
+    if ((now - player->last_progress_tick) < pdMS_TO_TICKS(50)) {
+        return;
+    }
+    player->last_progress_tick = now;
+    uint16_t progress = audio_provider_get_stream_progress(player->stream);
+    player_event_data_t data = {
+        .name = PLAYER_EVENT_PROGRESS,
+        .playback = {
+            .filename = player->current_filename,
+            .progress = progress,
+        },
+    };
+    player->event_cb(&data, player->event_cb_ctx);
+}
+
+/**
+ * @brief Fire an event that carries a volume index (READY or VOLUME_CHANGED)
+ */
+static void fire_event_volume(player_state_t *player, player_event_name_t event, int volume_index)
+{
+    if (player->event_cb == NULL) {
+        return;
+    }
+    player_event_data_t data = {
+        .name = event,
+        .volume_index = volume_index,
+    };
+    player->event_cb(&data, player->event_cb_ctx);
+}
+
+/* -------------------------------------------------------------------------
+ * Audio processing helpers
+ * ------------------------------------------------------------------------- */
+
 static void apply_software_volume(int16_t *buffer, size_t sample_count, uint32_t factor)
 {
     // Skip if full volume (no scaling needed)
@@ -210,7 +287,13 @@ static esp_err_t send_chunk(player_state_t *player, size_t *bytes_written)
 
     // Write samples to I2S device
     size_t bytes_to_write = samples_read * sizeof(int16_t);
+#ifdef IO_STATS_ENABLE
+    int64_t start_us = benchmark_start();
+#endif
     ret = i2s_channel_write(player->i2s_channel, player->pcm_buf, bytes_to_write, bytes_written, I2S_WRITE_TIMEOUT_MS);
+#ifdef IO_STATS_ENABLE
+    benchmark_record(BENCH_I2S_WRITE, start_us, *bytes_written);
+#endif
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "I2S write error: %s", esp_err_to_name(ret));
         return ret;
@@ -412,22 +495,15 @@ static void close_stream(player_state_t *player, player_event_name_t event, esp_
         player->stream = NULL;
     }
 
+#ifdef IO_STATS_ENABLE
+    // log stats
+    benchmark_log_and_reset(BENCH_I2S_WRITE, player->current_filename);
+#endif
 
     // Shutdown amplifier if requested
     set_i2s_sd_gpio(enable_amp);
 
-    // fire a callback event
-    if (player->event_cb != NULL) {
-        player_event_data_t event_data = {
-            .name = event,
-        };
-        if (event == PLAYER_EVENT_ERROR) {
-            event_data.error_code = error_code;
-        } else {
-            event_data.filename = NULL;
-        }
-        player->event_cb(&event_data, player->event_cb_ctx);
-    }
+    fire_event_close(player, event, error_code);
 }
 
 /**
@@ -436,7 +512,7 @@ static void close_stream(player_state_t *player, player_event_name_t event, esp_
  * @param player Player state
  * @param filename Path to audio file
  */
-static void cmd_play(player_state_t *player, const char filename[256])
+static void cmd_play(player_state_t *player, const char *filename)
 {
     if(player->stream != NULL) {
         // stop current stream first
@@ -474,14 +550,7 @@ static void cmd_play(player_state_t *player, const char filename[256])
     player->current_filename[sizeof(player->current_filename) - 1] = '\0';
     player->last_progress_tick = 0;
 
-    // Fire callback event to notify playback started
-    if (player->event_cb != NULL) {
-        player_event_data_t event_data = {
-            .name = PLAYER_EVENT_STARTED,
-            .filename = filename,
-        };
-        player->event_cb(&event_data, player->event_cb_ctx);
-    }
+    fire_event_started(player, filename);
 
     // player main loop will start sending chunks from player->stream to I2S channel
 }
@@ -555,22 +624,7 @@ static void player_task(void *arg)
             continue;
         }
 
-        // Report progress (time-throttled: max ~20 updates/sec to avoid display queue flood)
-        if (player->event_cb != NULL) {
-            TickType_t now = xTaskGetTickCount();
-            if ((now - player->last_progress_tick) >= pdMS_TO_TICKS(50)) {
-                player->last_progress_tick = now;
-                uint16_t progress = audio_provider_get_stream_progress(player->stream);
-                player_event_data_t event_data = {
-                    .name = PLAYER_EVENT_PROGRESS,
-                    .playback = {
-                        .filename = player->current_filename,
-                        .progress = progress,
-                    },
-                };
-                player->event_cb(&event_data, player->event_cb_ctx);
-            }
-        }
+        fire_event_progress(player);
     }
 }
 
@@ -579,164 +633,8 @@ static void player_task(void *arg)
 // public API implementation
 //=========================================================
 
-/**
- * @brief Cleanup helper for partial initialization failure
- *
- * Releases resources in reverse order of allocation.
- * Safe to call with NULL handles (skips cleanup for uninitialized resources).
- */
-static void cleanup_player_state(player_state_t *state)
-{
-    set_i2s_sd_gpio(false);
-    if (state == NULL) {
-        return;
-    }
-    if (state->player_task_handle != NULL) {
-        vTaskDelete(state->player_task_handle);
-    }
-    if (state->cmd_queue != NULL) {
-        vQueueDelete(state->cmd_queue);
-    }
-    if (state->volume_mutex != NULL) {
-        vSemaphoreDelete(state->volume_mutex);
-    }
-    if (state->pcm_buf != NULL) {
-        free(state->pcm_buf);
-    }
-    if (state->provider != NULL) {
-        audio_provider_deinit(state->provider);
-    }
-    if (state->i2s_channel != NULL) {
-        i2s_channel_disable(state->i2s_channel);
-        i2s_del_channel(state->i2s_channel);
-    }
-    free(state);
-}
 
-esp_err_t player_init(const player_config_t *config, player_handle_t *player)
-{
-    if (config == NULL || player == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    // Allocate player state
-    player_state_t *state = (player_state_t *)calloc(1, sizeof(player_state_t));
-    if (state == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate player state");
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Store configuration
-    state->event_cb = config->event_cb;
-    state->event_cb_ctx = config->event_cb_ctx;
-
-    // Create volume mutex for thread-safe volume access
-    state->volume_mutex = xSemaphoreCreateMutex();
-    if (state->volume_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create volume mutex");
-        cleanup_player_state(state);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Initialize I2S channel for audio output
-    esp_err_t ret = init_i2s_channel(state);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize I2S channel: %s", esp_err_to_name(ret));
-        cleanup_player_state(state);
-        return ret;
-    }
-
-    // Initialize persistent volume module (creates deferred save timer)
-    persistent_volume_init();
-
-    // Load volume from NVS (or use defaults if not saved)
-    uint16_t saved_curve = 0;
-    uint16_t saved_index = 0;
-    esp_err_t vol_ret = persistent_volume_load(&saved_curve, &saved_index);
-    if (vol_ret != ESP_OK) {
-        // Fallback to default if NVS fails
-        saved_index = VOLUME_LEVELS / 2;
-        ESP_LOGW(TAG, "Failed to load volume from NVS, using default");
-    }
-
-    // Clamp index to valid range (in case of corrupted NVS data)
-    if (saved_index >= VOLUME_LEVELS) {
-        saved_index = VOLUME_LEVELS - 1;
-    }
-
-    state->vol_current = (uint8_t)saved_index;
-    state->sw_volume_factor = volume_table[state->vol_current];
-    ESP_LOGI(TAG, "Initial volume: index %d (factor %lu/65536)", state->vol_current, (unsigned long)state->sw_volume_factor);
-
-    // Create audio provider
-    audio_provider_config_t provider_config = {
-        .cache_size_kb = config->cache_size_kb,
-    };
-    ret = audio_provider_init(&provider_config, &state->provider);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create audio provider: %s", esp_err_to_name(ret));
-        cleanup_player_state(state);
-        return ret;
-    }
-
-    // Allocate PCM buffer - pass data chunks from audio_provider to i2s_channel_write()
-    state->pcm_buf = (int16_t *)malloc(PCM_BUFFER_SIZE * sizeof(int16_t));
-    if (state->pcm_buf == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate PCM buffer");
-        cleanup_player_state(state);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Create command queue
-    state->cmd_queue = xQueueCreate(10, sizeof(player_cmd_t));
-    if (state->cmd_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create command queue");
-        cleanup_player_state(state);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Create player task
-    BaseType_t task_created = xTaskCreatePinnedToCore(
-        player_task,
-        "player_task",
-        PLAYER_TASK_STACK_SIZE,
-        (void *)state,
-        PLAYER_TASK_PRIORITY,
-        &state->player_task_handle,
-        PLAYER_TASK_CORE_ID
-    );
-
-    if (task_created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create player task");
-        cleanup_player_state(state);
-        return ESP_ERR_NO_MEM;
-    }
-
-    *player = state;
-    ESP_LOGI(TAG, "Player initialized successfully");
-
-    // Fire PLAYER_EVENT_READY callback with initial volume
-    if (state->event_cb != NULL) {
-        player_event_data_t event_data = {
-            .name = PLAYER_EVENT_READY,
-            .volume_index = state->vol_current,
-        };
-        state->event_cb(&event_data, state->event_cb_ctx);
-    }
-
-    // Queue a command to play a short sound to confirm init completion
-    // DISABLED but DO NOT DELETE
-    // ret = player_play(state, STARTUP_SOUND, 0, 1);
-    // ESP_LOGD(TAG, "called player_play() with startup sound");
-    // if (ret != ESP_OK) {
-    //     ESP_LOGW(TAG, "Failed to send command to play startup sound: %s", esp_err_to_name(ret));
-    //     // Continue anyway - non-critical
-    // }
-
-    return ESP_OK;
-}
-
-esp_err_t send_cmd(player_handle_t player, player_cmd_t *cmd)
+static esp_err_t send_cmd(player_handle_t player, player_cmd_t *cmd)
 {
     if (player == NULL || cmd == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -805,25 +703,6 @@ void player_flush_preload(player_handle_t player)
     audio_provider_flush_preload_queue(state->provider);
 }
 
-esp_err_t player_deinit(player_handle_t player)
-{
-    if (player == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    player_state_t *state = (player_state_t *)player;
-
-    // Stop playback if active
-    if (state->stream != NULL) {
-        close_stream(player, PLAYER_EVENT_STOPPED, ESP_OK, false);
-    }
-
-    // Cleanup all resources
-    cleanup_player_state(state);
-    ESP_LOGI(TAG, "Player deinitialized");
-    return ESP_OK;
-}
-
 /* =============================================================================
  * Synchronous Volume API (for software volume - no USB queries needed)
  * ============================================================================= */
@@ -872,16 +751,9 @@ esp_err_t player_volume_set(player_handle_t player, int8_t index)
     ESP_LOGI(TAG, "Set volume (sync): index %d (factor %lu/65536)", index, (unsigned long)factor);
 
     // Schedule deferred save to NVS (coalesces rapid changes)
-    persistent_volume_save_deferred(0, (uint16_t)index);
+    persistent_volume_save_deferred((uint16_t)index);
 
-    // Fire event callback to notify volume change
-    if (state->event_cb != NULL) {
-        player_event_data_t event_data = {
-            .name = PLAYER_EVENT_VOLUME_CHANGED,
-            .volume_index = index,
-        };
-        state->event_cb(&event_data, state->event_cb_ctx);
-    }
+    fire_event_volume(state, PLAYER_EVENT_VOLUME_CHANGED, index);
 
     return ESP_OK;
 }
@@ -904,6 +776,168 @@ esp_err_t player_volume_adjust(player_handle_t player, int8_t step)
     xSemaphoreGive(state->volume_mutex);
 
     return player_volume_set(player, (int8_t)new_index);
+}
+
+
+
+
+/**
+ * @brief Cleanup helper for partial initialization failure
+ *
+ * Releases resources in reverse order of allocation.
+ * Safe to call with NULL handles (skips cleanup for uninitialized resources).
+ */
+static void cleanup_player_state(player_state_t *state)
+{
+    set_i2s_sd_gpio(false);
+    if (state == NULL) {
+        return;
+    }
+    if (state->player_task_handle != NULL) {
+        vTaskDelete(state->player_task_handle);
+    }
+    if (state->cmd_queue != NULL) {
+        vQueueDelete(state->cmd_queue);
+    }
+    if (state->volume_mutex != NULL) {
+        vSemaphoreDelete(state->volume_mutex);
+    }
+    if (state->pcm_buf != NULL) {
+        heap_caps_free(state->pcm_buf);
+    }
+    if (state->provider != NULL) {
+        audio_provider_deinit(state->provider);
+    }
+    if (state->i2s_channel != NULL) {
+        i2s_channel_disable(state->i2s_channel);
+        i2s_del_channel(state->i2s_channel);
+    }
+    heap_caps_free(state);
+}
+
+esp_err_t player_init(const player_config_t *config, player_handle_t *player)
+{
+    if (config == NULL || player == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Allocate player state
+    player_state_t *state = (player_state_t *)heap_caps_calloc(1, sizeof(player_state_t), MALLOC_CAP_INTERNAL);
+    if (state == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate player state");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Store configuration
+    state->event_cb = config->event_cb;
+    state->event_cb_ctx = config->event_cb_ctx;
+
+    // Create volume mutex for thread-safe volume access
+    state->volume_mutex = xSemaphoreCreateMutex();
+    if (state->volume_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create volume mutex");
+        cleanup_player_state(state);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Initialize I2S channel for audio output
+    esp_err_t ret = init_i2s_channel(state);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize I2S channel: %s", esp_err_to_name(ret));
+        cleanup_player_state(state);
+        return ret;
+    }
+
+    // Initialize persistent volume module (creates deferred save timer)
+    persistent_volume_init();
+
+    // Load volume from NVS (or use defaults if not saved)
+    uint16_t saved_index = 0;
+    esp_err_t vol_ret = persistent_volume_load(&saved_index);
+    if (vol_ret != ESP_OK) {
+        // Fallback to default if NVS fails
+        saved_index = VOLUME_LEVELS / 2;
+        ESP_LOGW(TAG, "Failed to load volume from NVS, using default");
+    }
+
+    // Clamp index to valid range (in case of corrupted NVS data)
+    if (saved_index >= VOLUME_LEVELS) {
+        saved_index = VOLUME_LEVELS - 1;
+    }
+
+    state->vol_current = (uint8_t)saved_index;
+    state->sw_volume_factor = volume_table[state->vol_current];
+    ESP_LOGI(TAG, "Initial volume: index %d (factor %lu/65536)", state->vol_current, (unsigned long)state->sw_volume_factor);
+
+    // Create audio provider
+    audio_provider_config_t provider_config = {
+        .cache_size_kb = config->cache_size_kb,
+    };
+    ret = audio_provider_init(&provider_config, &state->provider);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create audio provider: %s", esp_err_to_name(ret));
+        cleanup_player_state(state);
+        return ret;
+    }
+
+    // Allocate PCM buffer - pass data chunks from audio_provider to i2s_channel_write()
+    state->pcm_buf = (int16_t *)heap_caps_malloc(PCM_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (state->pcm_buf == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate PCM buffer");
+        cleanup_player_state(state);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Create command queue
+    state->cmd_queue = xQueueCreate(PLAYER_CMD_QUEUE_DEPTH, sizeof(player_cmd_t));
+    if (state->cmd_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create command queue");
+        cleanup_player_state(state);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Create player task
+    BaseType_t task_created = xTaskCreatePinnedToCore(
+        player_task,
+        "player_task",
+        PLAYER_TASK_STACK_SIZE,
+        (void *)state,
+        PLAYER_TASK_PRIORITY,
+        &state->player_task_handle,
+        PLAYER_TASK_CORE_ID
+    );
+
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create player task");
+        cleanup_player_state(state);
+        return ESP_ERR_NO_MEM;
+    }
+
+    *player = state;
+    ESP_LOGI(TAG, "Player initialized successfully");
+
+    fire_event_volume(state, PLAYER_EVENT_READY, state->vol_current);
+
+    return ESP_OK;
+}
+
+esp_err_t player_deinit(player_handle_t player)
+{
+    if (player == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    player_state_t *state = (player_state_t *)player;
+
+    // Stop playback if active
+    if (state->stream != NULL) {
+        close_stream(player, PLAYER_EVENT_STOPPED, ESP_OK, false);
+    }
+
+    // Cleanup all resources
+    cleanup_player_state(state);
+    ESP_LOGI(TAG, "Player deinitialized");
+    return ESP_OK;
 }
 
 void player_print_status(player_handle_t player, status_output_type_t output_type)

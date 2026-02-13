@@ -9,13 +9,11 @@
 #include "esp_err.h"
 #include "input_scanner.h"
 #include "player.h"
+#include "soundboard.h"
 
 /**
- * @brief Maximum lengths for various config fields
+ * @brief Maximum page identifier length (including NUL terminator)
  */
-#define CONFIG_MAX_NAME_LEN     32
-#define CONFIG_MAX_PATH_LEN     256
-#define CONFIG_MAX_DEVICES      4
 #define PAGE_ID_MAX_LEN         32
 
 /**
@@ -43,7 +41,7 @@ typedef struct {
     action_type_t type;
     union {
         struct {
-            char filename[CONFIG_MAX_PATH_LEN];
+            char filename[SOUNDBOARD_MAX_PATH_LEN];
         } play;
     } params;
 } action_t;
@@ -193,7 +191,7 @@ esp_err_t mapper_init(const mapper_config_t *config, mapper_handle_t *out_handle
  * @note Called from input_scanner task context (not ISR)
  * @note Thread safety: Relies on input_scanner serialization
  */
-void mapper_handle_event(mapper_handle_t handle,
+void mapper_on_input_event(mapper_handle_t handle,
                         uint8_t button_number,
                         input_event_type_t event);
 

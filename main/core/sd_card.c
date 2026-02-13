@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2025 Vincent (Soundboard Project) Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2025 Vincent (Soundboard Project)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -10,15 +10,19 @@
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"   // IWYU pragma: keep
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_vfs_fat.h"
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 
 #include "sd_card.h"
-#include "soundboard.h"
 
-#define SD_CARD_STABILISATION_DELAY 250
-#define SD_CARD_MAX_FREQ_KHZ 10000
+#define SD_CARD_STABILISATION_DELAY_MS 250
+#define SD_CARD_MAX_FREQ_KHZ       10000
+#define SD_CARD_MAX_OPEN_FILES      10
+#define SD_CARD_ALLOC_UNIT_SIZE     ((size_t)(16 * 1024))
+#define SD_CARD_FATFS_DRIVE         "0:"
+#define BYTES_PER_GB                (1024ULL * 1024 * 1024)
 
 static const char *TAG = "sd_card";
 static const char *s_mount_point = NULL;
@@ -26,8 +30,6 @@ static sdmmc_card_t *s_card = NULL;
 
 esp_err_t sd_card_init(const sd_card_spi_config_t *config, sdmmc_card_t **out_card)
 {
-    esp_log_level_set(TAG, ESP_LOG_DEBUG);
-
     if (config == NULL) {
         ESP_LOGE(TAG, "config is NULL");
         return ESP_ERR_INVALID_ARG;
@@ -47,7 +49,7 @@ esp_err_t sd_card_init(const sd_card_spi_config_t *config, sdmmc_card_t **out_ca
 
     // Options for mounting the filesystem
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-        .format_if_mount_failed = false, .max_files = 10, .allocation_unit_size = (size_t)(16 * 1024)};
+        .format_if_mount_failed = false, .max_files = SD_CARD_MAX_OPEN_FILES, .allocation_unit_size = SD_CARD_ALLOC_UNIT_SIZE};
 
     ESP_LOGI(TAG, "Initializing SD card via SPI");
     ESP_LOGI(TAG, "Using SPI pins - MOSI:%d MISO:%d CLK:%d CS:%d", config->mosi_io_num, config->miso_io_num,
@@ -57,7 +59,7 @@ esp_err_t sd_card_init(const sd_card_spi_config_t *config, sdmmc_card_t **out_ca
     // Wait for SD card to power up and stabilize
     // SD cards require 1ms minimum, but some need up to 74 clock cycles at 400kHz
     ESP_LOGI(TAG, "Waiting for SD card to stabilize (250ms)");
-    vTaskDelay(pdMS_TO_TICKS(SD_CARD_STABILISATION_DELAY));
+    vTaskDelay(pdMS_TO_TICKS(SD_CARD_STABILISATION_DELAY_MS));
 
     // Initialize SPI bus
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
@@ -131,7 +133,10 @@ esp_err_t sd_card_deinit(sdmmc_card_t *card)
     }
 
     // Free SPI bus
-    spi_bus_free(SDSPI_DEFAULT_HOST);
+    ret = spi_bus_free(SDSPI_DEFAULT_HOST);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to free SPI bus: %s", esp_err_to_name(ret));
+    }
 
     ESP_LOGI(TAG, "SD card unmounted");
 
@@ -142,7 +147,7 @@ esp_err_t sd_card_deinit(sdmmc_card_t *card)
  * SD Card Erase
  * ============================================================================ */
 
-#define ERASE_PATH_MAX 512
+#define ERASE_PATH_MAX SOUNDBOARD_MAX_PATH_LEN
 
 static int erase_directory_contents(const char *path)
 {
@@ -160,7 +165,7 @@ static int erase_directory_contents(const char *path)
     struct dirent *entry;
     struct stat entry_stat;
 
-    char *full_path = malloc(ERASE_PATH_MAX);
+    char *full_path = heap_caps_malloc(ERASE_PATH_MAX, MALLOC_CAP_INTERNAL);
     if (!full_path) {
         closedir(dir);
         return -1;
@@ -200,7 +205,7 @@ static int erase_directory_contents(const char *path)
         }
     }
 
-    free(full_path);
+    heap_caps_free(full_path);
     closedir(dir);
     return deleted_count;
 }
@@ -248,8 +253,7 @@ void sd_card_print_status(status_output_type_t output_type)
         // Get free space using FATFS
         FATFS *fs;
         DWORD free_clusters;
-        // Drive number 0 for SD card (mounted as "0:")
-        if (f_getfree("0:", &free_clusters, &fs) == FR_OK) {
+        if (f_getfree(SD_CARD_FATFS_DRIVE, &free_clusters, &fs) == FR_OK) {
             free_bytes = (uint64_t)free_clusters * fs->csize * s_card->csd.sector_size;
             if (total_bytes > 0) {
                 free_percent = (int)((free_bytes * 100) / total_bytes);
@@ -261,8 +265,8 @@ void sd_card_print_status(status_output_type_t output_type)
         if (mounted) {
             printf("[sdcard] mounted at %s, %.1fGB free / %.1fGB\n",
                    s_mount_point,
-                   (double)free_bytes / (1024 * 1024 * 1024),
-                   (double)total_bytes / (1024 * 1024 * 1024));
+                   (double)free_bytes / BYTES_PER_GB,
+                   (double)total_bytes / BYTES_PER_GB);
         } else {
             printf("[sdcard] not mounted\n");
         }
@@ -271,10 +275,9 @@ void sd_card_print_status(status_output_type_t output_type)
         if (mounted) {
             printf("  State: Mounted\n");
             printf("  Mount point: %s\n", s_mount_point);
-            printf("  Capacity: %.1f GB\n", (double)total_bytes / (1024 * 1024 * 1024));
+            printf("  Capacity: %.1f GB\n", (double)total_bytes / BYTES_PER_GB);
             printf("  Free space: %.1f GB (%d%%)\n",
-                   (double)free_bytes / (1024 * 1024 * 1024), free_percent);
-            printf("  Filesystem: FAT\n");
+                   (double)free_bytes / BYTES_PER_GB, free_percent);
 
             if (output_type == STATUS_OUTPUT_VERBOSE) {
                 printf("  Card name: %s\n", s_card->cid.name);

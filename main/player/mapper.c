@@ -9,6 +9,7 @@
 #include "mapper.h"
 #include "player.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "mapper";
 
@@ -83,7 +84,7 @@ struct mapper_s {
     // Button FSM: single active button tracking
     button_fsm_state_t button_fsm_state;
     uint8_t current_button;                     // 0 = none, 1-12 = matrix button
-    char current_filename[CONFIG_MAX_PATH_LEN]; // filename of active playback
+    char current_filename[SOUNDBOARD_MAX_PATH_LEN]; // filename of active playback
 };
 
 /* ============================================================================
@@ -101,7 +102,7 @@ static page_node_t *find_or_create_page(mapper_handle_t mapper, const char *page
 {
     // If no pages exist yet, create first page
     if (mapper->current_page == NULL) {
-        page_node_t *new_page = calloc(1, sizeof(page_node_t));
+        page_node_t *new_page = heap_caps_calloc(1, sizeof(page_node_t), MALLOC_CAP_INTERNAL);
         if (new_page == NULL) {
             ESP_LOGE(TAG, "Failed to allocate page node for page '%s'", page_id);
             return NULL;
@@ -131,7 +132,7 @@ static page_node_t *find_or_create_page(mapper_handle_t mapper, const char *page
     } while (page != start);
 
     // Create new page and insert after current
-    page_node_t *new_page = calloc(1, sizeof(page_node_t));
+    page_node_t *new_page = heap_caps_calloc(1, sizeof(page_node_t), MALLOC_CAP_INTERNAL);
     if (new_page == NULL) {
         ESP_LOGE(TAG, "Failed to allocate page node for page '%s'", page_id);
         return NULL;
@@ -183,7 +184,7 @@ static esp_err_t insert_mapping(page_node_t *page, uint8_t button_number,
     }
 
     // Create new mapping node (insert at head for simplicity)
-    mapping_node_t *new_mapping = calloc(1, sizeof(mapping_node_t));
+    mapping_node_t *new_mapping = heap_caps_calloc(1, sizeof(mapping_node_t), MALLOC_CAP_INTERNAL);
     if (new_mapping == NULL) {
         ESP_LOGE(TAG, "Failed to allocate mapping node");
         return ESP_ERR_NO_MEM;
@@ -206,7 +207,7 @@ static void free_page_mappings(page_node_t *page)
     mapping_node_t *mapping = page->mappings;
     while (mapping != NULL) {
         mapping_node_t *next = mapping->next;
-        free(mapping);
+        heap_caps_free(mapping);
         mapping = next;
     }
     page->mappings = NULL;
@@ -231,7 +232,7 @@ static void free_all_pages(mapper_handle_t mapper)
     while (page != NULL) {
         page_node_t *next = page->next;
         free_page_mappings(page);
-        free(page);
+        heap_caps_free(page);
         page = next;
     }
 
@@ -388,7 +389,7 @@ static const action_spec_t* find_action_spec(const char* name)
 /**
  * @brief Build absolute path from root and relative filename
  *
- * @param dest Destination buffer (must be at least CONFIG_MAX_PATH_LEN)
+ * @param dest Destination buffer (must be at least SOUNDBOARD_MAX_PATH_LEN)
  * @param root Root mount point (e.g., "/sdcard")
  * @param filename Relative filename from CSV (e.g., "laser.wav" or "sounds/laser.wav")
  */
@@ -401,7 +402,7 @@ static void build_absolute_path(char *dest, const char *root, const char *filena
     }
 
     // Build path: root + "/" + filename
-    snprintf(dest, CONFIG_MAX_PATH_LEN, "%s/%s", root, rel_filename);
+    snprintf(dest, SOUNDBOARD_MAX_PATH_LEN, "%s/%s", root, rel_filename);
 }
 
 /**
@@ -589,7 +590,7 @@ static esp_err_t load_mappings_from_file(mapper_handle_t mapper, const char *roo
     }
 
     // Build full path to mappings file
-    char path[CONFIG_MAX_PATH_LEN];
+    char path[SOUNDBOARD_MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/%s", root, mappings_filename);
 
     FILE *f = fopen(path, "r");
@@ -617,8 +618,9 @@ static esp_err_t load_mappings_from_file(mapper_handle_t mapper, const char *roo
 
         ret = parse_and_insert_mapping(mapper, line, root, source_name);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "%s line %d: Failed to parse mapping", source_name, line_num);
-            break;
+            // non fatal - keep loading
+            ESP_LOGW(TAG, "%s line %d: Failed to parse mapping", source_name, line_num);
+            continue;
         }
         loaded_count++;
     }
@@ -916,8 +918,8 @@ static void execute_action(mapper_handle_t mapper, uint8_t button_number,
             player_play(mapper->player, action->params.play.filename);
             mapper->button_fsm_state = BTN_STATE_PLAY_ONCE;
             mapper->current_button = button_number;
-            strncpy(mapper->current_filename, action->params.play.filename, CONFIG_MAX_PATH_LEN - 1);
-            mapper->current_filename[CONFIG_MAX_PATH_LEN - 1] = '\0';
+            strncpy(mapper->current_filename, action->params.play.filename, SOUNDBOARD_MAX_PATH_LEN - 1);
+            mapper->current_filename[SOUNDBOARD_MAX_PATH_LEN - 1] = '\0';
             break;
 
         case ACTION_TYPE_PLAY_CUT:
@@ -925,8 +927,8 @@ static void execute_action(mapper_handle_t mapper, uint8_t button_number,
             player_play(mapper->player, action->params.play.filename);
             mapper->button_fsm_state = BTN_STATE_PLAY_CUT;
             mapper->current_button = button_number;
-            strncpy(mapper->current_filename, action->params.play.filename, CONFIG_MAX_PATH_LEN - 1);
-            mapper->current_filename[CONFIG_MAX_PATH_LEN - 1] = '\0';
+            strncpy(mapper->current_filename, action->params.play.filename, SOUNDBOARD_MAX_PATH_LEN - 1);
+            mapper->current_filename[SOUNDBOARD_MAX_PATH_LEN - 1] = '\0';
             break;
 
         case ACTION_TYPE_PLAY_LOCK:
@@ -934,8 +936,8 @@ static void execute_action(mapper_handle_t mapper, uint8_t button_number,
             player_play(mapper->player, action->params.play.filename);
             mapper->button_fsm_state = BTN_STATE_PLAY_LOCK_PENDING;
             mapper->current_button = button_number;
-            strncpy(mapper->current_filename, action->params.play.filename, CONFIG_MAX_PATH_LEN - 1);
-            mapper->current_filename[CONFIG_MAX_PATH_LEN - 1] = '\0';
+            strncpy(mapper->current_filename, action->params.play.filename, SOUNDBOARD_MAX_PATH_LEN - 1);
+            mapper->current_filename[SOUNDBOARD_MAX_PATH_LEN - 1] = '\0';
             break;
 
         default:
@@ -945,6 +947,110 @@ static void execute_action(mapper_handle_t mapper, uint8_t button_number,
 
     // Notify via unified callback
     notify_action_executed(mapper, button_number, event, action);
+}
+
+/* ============================================================================
+ * Event Handlers (called from mapper_handle_event)
+ * ============================================================================ */
+
+/**
+ * @brief Handle encoder rotation (CW/CCW) for volume or page navigation
+ */
+static void handle_encoder_rotation(mapper_handle_t handle, input_event_type_t event)
+{
+    int8_t direction = (event == INPUT_EVENT_ENCODER_ROTATE_CW) ? 1 : -1;
+
+    if (handle->encoder_mode == ENCODER_MODE_VOLUME) {
+        ESP_LOGD(TAG, "Encoder: volume %s", direction > 0 ? "up" : "down");
+        player_volume_adjust(handle->player, direction);
+    } else {
+        if (handle->current_page != NULL && handle->page_count > 1) {
+            handle->current_page = (direction > 0) ? handle->current_page->next
+                                                    : handle->current_page->prev;
+            ESP_LOGI(TAG, "Encoder: page changed to '%s'", handle->current_page->page_id);
+            notify_page_changed(handle);
+            preload_current_page_files(handle);
+        }
+    }
+}
+
+/**
+ * @brief Handle encoder switch press/long-press for mode toggle
+ */
+static void handle_encoder_switch(mapper_handle_t handle, input_event_type_t event)
+{
+    if (event == INPUT_EVENT_BUTTON_PRESS) {
+        handle->encoder_mode = (handle->encoder_mode == ENCODER_MODE_VOLUME)
+                               ? ENCODER_MODE_PAGE
+                               : ENCODER_MODE_VOLUME;
+        ESP_LOGI(TAG, "Encoder mode changed to %s",
+                 handle->encoder_mode == ENCODER_MODE_VOLUME ? "VOLUME" : "PAGE");
+        notify_encoder_mode_changed(handle, handle->encoder_mode);
+    } else if (event == INPUT_EVENT_BUTTON_LONG_PRESS) {
+        ESP_LOGD(TAG, "Encoder switch long press: reserved");
+    }
+}
+
+/**
+ * @brief Handle button release via button FSM
+ */
+static void handle_button_release(mapper_handle_t handle, uint8_t button_number)
+{
+    if (handle->current_button != button_number) {
+        return;
+    }
+
+    switch (handle->button_fsm_state) {
+        case BTN_STATE_PLAY_CUT:
+        case BTN_STATE_PLAY_LOCK_PENDING:
+            ESP_LOGI(TAG, "Button %d released: stopping playback", button_number);
+            player_stop(handle->player, true);
+            handle->button_fsm_state = BTN_STATE_INITIAL;
+            break;
+        case BTN_STATE_PLAY_ONCE:
+        case BTN_STATE_PLAY_LOCKED:
+            handle->button_fsm_state = BTN_STATE_INITIAL;
+            break;
+        case BTN_STATE_INITIAL:
+            break;
+    }
+}
+
+/**
+ * @brief Handle direct page selection via button press in PAGE mode
+ */
+static void handle_direct_page_select(mapper_handle_t handle, uint8_t button_number)
+{
+    page_node_t *target_page = find_page_by_number(handle, button_number);
+    if (target_page != NULL) {
+        handle->current_page = target_page;
+        ESP_LOGI(TAG, "Direct page select: button %d -> page '%s'",
+                 button_number, target_page->page_id);
+
+        handle->encoder_mode = ENCODER_MODE_VOLUME;
+        notify_encoder_mode_changed(handle, ENCODER_MODE_VOLUME);
+        notify_page_changed(handle);
+        preload_current_page_files(handle);
+    } else {
+        ESP_LOGD(TAG, "Page %d does not exist (only %d pages loaded)",
+                 button_number, handle->page_count);
+    }
+}
+
+/**
+ * @brief Handle long-press for play_lock FSM transition (PENDING -> LOCKED)
+ *
+ * @return true if event was consumed, false otherwise
+ */
+static bool handle_play_lock_long_press(mapper_handle_t handle, uint8_t button_number)
+{
+    if (handle->current_button == button_number &&
+        handle->button_fsm_state == BTN_STATE_PLAY_LOCK_PENDING) {
+        handle->button_fsm_state = BTN_STATE_PLAY_LOCKED;
+        ESP_LOGI(TAG, "Play_lock button %d: locked (playback continues after release)", button_number);
+        return true;
+    }
+    return false;
 }
 
 /* ============================================================================
@@ -971,7 +1077,7 @@ esp_err_t mapper_init(const mapper_config_t *config, mapper_handle_t *out_handle
         return ESP_ERR_INVALID_ARG;
     }
 
-    mapper_handle_t mapper = calloc(1, sizeof(struct mapper_s));
+    mapper_handle_t mapper = heap_caps_calloc(1, sizeof(struct mapper_s), MALLOC_CAP_INTERNAL);
     if (mapper == NULL) {
         ESP_LOGE(TAG, "Failed to allocate mapper");
         return ESP_ERR_NO_MEM;
@@ -995,7 +1101,7 @@ esp_err_t mapper_init(const mapper_config_t *config, mapper_handle_t *out_handle
                                        config->sdcard_mappings_file);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to load mappings: %s", esp_err_to_name(ret));
-        free(mapper);
+        heap_caps_free(mapper);
         return ret;
     }
 
@@ -1019,7 +1125,7 @@ esp_err_t mapper_init(const mapper_config_t *config, mapper_handle_t *out_handle
     return ESP_OK;
 }
 
-void mapper_handle_event(mapper_handle_t handle,
+void mapper_on_input_event(mapper_handle_t handle,
                         uint8_t button_number,
                         input_event_type_t event)
 {
@@ -1027,116 +1133,41 @@ void mapper_handle_event(mapper_handle_t handle,
         return;
     }
 
-    // Encoder rotation handling - behavior depends on current mode
-    if (event == INPUT_EVENT_ENCODER_ROTATE_CW) {
-        if (handle->encoder_mode == ENCODER_MODE_VOLUME) {
-            ESP_LOGD(TAG, "Encoder: volume up");
-            player_volume_adjust(handle->player, 1);
-        } else {
-            // PAGE mode: next page (circular navigation)
-            if (handle->current_page != NULL && handle->page_count > 1) {
-                handle->current_page = handle->current_page->next;
-                ESP_LOGI(TAG, "Encoder: page changed to '%s'", handle->current_page->page_id);
-                notify_page_changed(handle);
-                preload_current_page_files(handle);
-            }
-        }
-        return;
-    }
-    if (event == INPUT_EVENT_ENCODER_ROTATE_CCW) {
-        if (handle->encoder_mode == ENCODER_MODE_VOLUME) {
-            ESP_LOGD(TAG, "Encoder: volume down");
-            player_volume_adjust(handle->player, -1);
-        } else {
-            // PAGE mode: previous page (circular navigation)
-            if (handle->current_page != NULL && handle->page_count > 1) {
-                handle->current_page = handle->current_page->prev;
-                ESP_LOGI(TAG, "Encoder: page changed to '%s'", handle->current_page->page_id);
-                notify_page_changed(handle);
-                preload_current_page_files(handle);
-            }
-        }
+    // Encoder rotation: volume or page navigation
+    if (event == INPUT_EVENT_ENCODER_ROTATE_CW || event == INPUT_EVENT_ENCODER_ROTATE_CCW) {
+        handle_encoder_rotation(handle, event);
         return;
     }
 
-    // Encoder switch uses button_number=0 with button events
+    // Encoder switch (button_number=0): mode toggle
     if (button_number == 0) {
-        if (event == INPUT_EVENT_BUTTON_PRESS) {
-            // Toggle encoder mode
-            handle->encoder_mode = (handle->encoder_mode == ENCODER_MODE_VOLUME)
-                                   ? ENCODER_MODE_PAGE
-                                   : ENCODER_MODE_VOLUME;
-            ESP_LOGI(TAG, "Encoder mode changed to %s",
-                     handle->encoder_mode == ENCODER_MODE_VOLUME ? "VOLUME" : "PAGE");
-
-            notify_encoder_mode_changed(handle, handle->encoder_mode);
-            return;
-        }
-        if (event == INPUT_EVENT_BUTTON_LONG_PRESS) {
-            ESP_LOGD(TAG, "Encoder switch long press: reserved");
-            return;
-        }
+        handle_encoder_switch(handle, event);
         return;
     }
 
-    // Handle RELEASE events via button FSM
-    if (event == INPUT_EVENT_BUTTON_RELEASE && button_number >= 1 && button_number <= 12) {
-        if (handle->current_button == button_number) {
-            switch (handle->button_fsm_state) {
-                case BTN_STATE_PLAY_CUT:
-                case BTN_STATE_PLAY_LOCK_PENDING:
-                    ESP_LOGI(TAG, "Button %d released: stopping playback", button_number);
-                    player_stop(handle->player, true);
-                    handle->button_fsm_state = BTN_STATE_INITIAL;
-                    break;
-                case BTN_STATE_PLAY_ONCE:
-                case BTN_STATE_PLAY_LOCKED:
-                    handle->button_fsm_state = BTN_STATE_INITIAL;
-                    break;
-                case BTN_STATE_INITIAL:
-                    break;
-            }
-        }
+    // Matrix buttons (1-12)
+    if (button_number < 1 || button_number > 12) {
+        return;
+    }
+
+    // Button release: FSM handles stop-on-release
+    if (event == INPUT_EVENT_BUTTON_RELEASE) {
+        handle_button_release(handle, button_number);
         return;
     }
 
     // Direct page selection in PAGE mode
-    if (handle->encoder_mode == ENCODER_MODE_PAGE &&
-        event == INPUT_EVENT_BUTTON_PRESS &&
-        button_number >= 1 && button_number <= 12) {
-
-        page_node_t *target_page = find_page_by_number(handle, button_number);
-        if (target_page != NULL) {
-            // Select the page
-            handle->current_page = target_page;
-            ESP_LOGI(TAG, "Direct page select: button %d -> page '%s'",
-                     button_number, target_page->page_id);
-
-            // Switch back to VOLUME mode
-            handle->encoder_mode = ENCODER_MODE_VOLUME;
-            notify_encoder_mode_changed(handle, ENCODER_MODE_VOLUME);
-
-            // Notify page change and preload files
-            notify_page_changed(handle);
-            preload_current_page_files(handle);
-        } else {
-            ESP_LOGD(TAG, "Page %d does not exist (only %d pages loaded)",
-                     button_number, handle->page_count);
-        }
-        return;  // Don't process as regular mapping
+    if (handle->encoder_mode == ENCODER_MODE_PAGE && event == INPUT_EVENT_BUTTON_PRESS) {
+        handle_direct_page_select(handle, button_number);
+        return;
     }
 
-    // Handle LONG_PRESS for play_lock: transition PENDING -> LOCKED
-    if (event == INPUT_EVENT_BUTTON_LONG_PRESS && button_number >= 1 && button_number <= 12) {
-        if (handle->current_button == button_number &&
-            handle->button_fsm_state == BTN_STATE_PLAY_LOCK_PENDING) {
-            handle->button_fsm_state = BTN_STATE_PLAY_LOCKED;
-            ESP_LOGI(TAG, "Play_lock button %d: locked (playback continues after release)", button_number);
-            return;  // Consume event
-        }
+    // Long-press: play_lock PENDING -> LOCKED transition
+    if (event == INPUT_EVENT_BUTTON_LONG_PRESS && handle_play_lock_long_press(handle, button_number)) {
+        return;
     }
 
-    // For matrix button events, look up mapping (using current page)
+    // Look up mapping in current page and execute
     const mapping_node_t *mapping = find_mapping(handle, button_number, event);
     if (mapping != NULL) {
         execute_action(handle, button_number, event, &mapping->action);
@@ -1154,7 +1185,7 @@ esp_err_t mapper_deinit(mapper_handle_t handle)
     }
 
     free_all_pages(handle);
-    free(handle);
+    heap_caps_free(handle);
 
     ESP_LOGI(TAG, "Mapper deinitialized");
 

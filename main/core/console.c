@@ -9,6 +9,7 @@
  * @brief ESP-IDF Console command handler
  */
 
+#include "sdkconfig.h"
 #include <sys/stat.h>
 #include <dirent.h>
 #include "freertos/FreeRTOS.h"  // IWYU pragma: keep
@@ -21,6 +22,10 @@
 #include "sd_card.h"
 #include "persistent_volume.h"
 #include "soundboard.h"
+
+#ifdef CONFIG_SOUNDBOARD_IO_STATS_ENABLE
+    #include "benchmark.h"
+#endif
 
 static const char *TAG = "console";
 
@@ -47,7 +52,7 @@ static void list_directory_recursive(const char *path, int depth)
 
     struct dirent *entry;
     struct stat entry_stat;
-    char full_path[512];
+    char full_path[SOUNDBOARD_MAX_PATH_LEN];
 
     while ((entry = readdir(dir)) != NULL) {
         // Skip "." and ".."
@@ -55,7 +60,10 @@ static void list_directory_recursive(const char *path, int depth)
             continue;
         }
 
-        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        int written = snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        if (written >= (int)sizeof(full_path)) {
+            continue;
+        }
 
         if (stat(full_path, &entry_stat) == 0) {
             // Print indentation
@@ -132,42 +140,61 @@ static int cmd_ls(int argc, char **argv)
 }
 
 /**
- * @brief 'cat_mappings' command - Print mappings.csv files
+ * @brief 'mapping' command - Show or cat button-to-sound mappings
+ *
+ * Usage: mapping [show|cat]
+ *   - show (default): print loaded mappings from mapper
+ *   - cat: print raw mappings.csv files from storage
  */
-static int cmd_cat_mappings(int argc, char **argv)
+static int cmd_mapping(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    const char *subcmd = "show";
+    if (argc >= 2) {
+        subcmd = argv[1];
+    }
 
-    printf("\n=== Button-to-Sound Mappings ===\n\n");
-
-    // Print SPIFFS mappings (internal/default)
-    printf("Internal mappings (SPIFFS):\n");
-    cat_file(SPIFFS_MAPPINGS_PATH);
-    printf("\n");
-
-    // Print SD card mappings (external/user)
-    printf("External mappings (SD Card):\n");
-    cat_file(SDCARD_MAPPINGS_PATH);
-    printf("\n");
+    if (strcmp(subcmd, "show") == 0) {
+        if (!s_app->mapper) {
+            printf("Mapper not available\n");
+            return 1;
+        }
+        mapper_print_mappings(s_app->mapper);
+    } else if (strcmp(subcmd, "cat") == 0) {
+        printf("\n=== Button-to-Sound Mappings ===\n\n");
+        printf("Internal mappings (SPIFFS):\n");
+        cat_file(SPIFFS_MAPPINGS_PATH);
+        printf("\n");
+        printf("External mappings (SD Card):\n");
+        cat_file(SDCARD_MAPPINGS_PATH);
+        printf("\n");
+    } else {
+        printf("Unknown subcommand: %s\n", subcmd);
+        printf("Usage: mapping [show|cat]\n");
+        return 1;
+    }
 
     return 0;
 }
 
 /**
- * @brief 'system_status' command - Memory and task information
+ * @brief Print system-level status (memory, tasks)
  */
-static int cmd_system_status(int argc, char **argv)
+static void print_system_status(status_output_type_t output_type)
 {
-    (void)argc;
-    (void)argv;
+    size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 
-    printf("\n=== System Status ===\n\n");
+    if (output_type == STATUS_OUTPUT_COMPACT) {
+        printf("[system] internal_free=%zuKB", internal_free / 1024);
+#if CONFIG_SPIRAM_SUPPORT
+        printf(", psram_free=%zuKB", heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+#endif
+        printf(", tasks=%u\n", (unsigned int)uxTaskGetNumberOfTasks());
+        return;
+    }
 
-    // Memory information
-    printf("Memory:\n");
+    printf("System Status:\n");
     printf("  Internal RAM:\n");
-    printf("    Free:     %6zu KB\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    printf("    Free:     %6zu KB\n", internal_free / 1024);
     printf("    Largest:  %6zu KB\n", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024);
     printf("    Minimum:  %6zu KB\n", heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024);
 
@@ -178,55 +205,40 @@ static int cmd_system_status(int argc, char **argv)
     printf("    Minimum:  %6zu KB\n", heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024);
 #endif
 
-    printf("\n");
+    if (output_type == STATUS_OUTPUT_VERBOSE) {
+        printf("  FreeRTOS Tasks:\n");
+        printf("    %-20s %8s %8s\n", "Name", "State", "Priority");
+        printf("    ------------------------------------------------\n");
 
-    // Task information
-    printf("FreeRTOS Tasks:\n");
-    printf("  %-20s %8s %8s\n", "Name", "State", "Priority");
-    printf("  ------------------------------------------------\n");
+        UBaseType_t num_tasks = uxTaskGetNumberOfTasks();
+        TaskStatus_t *task_status_array = pvPortMalloc(num_tasks * sizeof(TaskStatus_t));
 
-    // Get task list
-    UBaseType_t num_tasks = uxTaskGetNumberOfTasks();
-    TaskStatus_t *task_status_array = pvPortMalloc(num_tasks * sizeof(TaskStatus_t));
+        if (task_status_array != NULL) {
+            uint32_t total_runtime;
+            num_tasks = uxTaskGetSystemState(task_status_array, num_tasks, &total_runtime);
 
-    if (task_status_array != NULL) {
-        uint32_t total_runtime;
-        num_tasks = uxTaskGetSystemState(task_status_array, num_tasks, &total_runtime);
+            for (UBaseType_t i = 0; i < num_tasks; i++) {
+                const char *state_str;
+                switch (task_status_array[i].eCurrentState) {
+                    case eRunning:   state_str = "Running";  break;
+                    case eReady:     state_str = "Ready";    break;
+                    case eBlocked:   state_str = "Blocked";  break;
+                    case eSuspended: state_str = "Suspend";  break;
+                    case eDeleted:   state_str = "Deleted";  break;
+                    default:         state_str = "Unknown";  break;
+                }
 
-        for (UBaseType_t i = 0; i < num_tasks; i++) {
-            const char *state_str;
-            switch (task_status_array[i].eCurrentState) {
-                case eRunning:   state_str = "Running";  break;
-                case eReady:     state_str = "Ready";    break;
-                case eBlocked:   state_str = "Blocked";  break;
-                case eSuspended: state_str = "Suspend";  break;
-                case eDeleted:   state_str = "Deleted";  break;
-                default:         state_str = "Unknown";  break;
+                printf("    %-20s %8s %8u\n",
+                       task_status_array[i].pcTaskName,
+                       state_str,
+                       (unsigned int)task_status_array[i].uxCurrentPriority);
             }
 
-            printf("  %-20s %8s %8u\n",
-                   task_status_array[i].pcTaskName,
-                   state_str,
-                   (unsigned int)task_status_array[i].uxCurrentPriority);
+            vPortFree(task_status_array);
         }
-
-        vPortFree(task_status_array);
     }
-
-    printf("\n");
-    return 0;
 }
 
-/**
- * @brief 'application_status' command - App state and PSRAM logs
- */
-static int cmd_application_status(int argc, char **argv)
-{
-    (void)argc;
-    (void)argv;
-    app_print_status(STATUS_OUTPUT_NORMAL);
-    return 0;
-}
 
 /**
  * @brief 'erase_sdcard' command - Recursively erase all files on SD card
@@ -281,6 +293,7 @@ static status_output_type_t parse_output_type(const char *str)
 static void print_all_status(status_output_type_t output_type)
 {
     app_print_status(output_type);
+    print_system_status(output_type);
     sd_card_print_status(output_type);
     persistent_volume_print_status(output_type);
     display_print_status(s_app->oled, output_type);
@@ -288,6 +301,9 @@ static void print_all_status(status_output_type_t output_type)
     mapper_print_status(s_app->mapper, output_type);
     player_print_status(s_app->player, output_type);
     msc_print_status(s_app->msc, output_type);
+#ifdef IO_STATS_ENABLE
+    benchmark_print_status(output_type);
+#endif
 }
 
 /**
@@ -315,6 +331,7 @@ static int cmd_status(int argc, char **argv)
         printf("Usage: status <module|all|help> [compact|normal|verbose]\n\n");
         printf("Available modules:\n");
         printf("  app      - Application state\n");
+        printf("  system   - Memory and FreeRTOS tasks\n");
         printf("  mapper   - Button-to-action mapping\n");
         printf("  sdcard   - SD card storage\n");
         printf("  msc      - USB MSC host\n");
@@ -339,6 +356,8 @@ static int cmd_status(int argc, char **argv)
     // Handle individual modules
     if (strcmp(module, "app") == 0) {
         app_print_status(output_type);
+    } else if (strcmp(module, "system") == 0) {
+        print_system_status(output_type);
     } else if (strcmp(module, "mapper") == 0) {
         mapper_print_status(s_app->mapper, output_type);
     } else if (strcmp(module, "sdcard") == 0) {
@@ -353,10 +372,60 @@ static int cmd_status(int argc, char **argv)
         persistent_volume_print_status(output_type);
     } else if (strcmp(module, "player") == 0) {
         player_print_status(s_app->player, output_type);
+#ifdef IO_STATS_ENABLE
+    } else if (strcmp(module, "benchmark") == 0) {
+        benchmark_print_status(output_type);
+#endif
     } else {
         printf("Unknown module: %s\n", module);
         printf("Type 'status help' for available modules.\n");
         return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief 'cat' command - Dump file contents to console
+ *
+ * Usage: cat <path>
+ * Outputs up to 4096 bytes of the file to the console.
+ */
+static int cmd_cat(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: cat <path>\n");
+        return 1;
+    }
+
+    const char *path = argv[1];
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        printf("Cannot open: %s\n", path);
+        return 1;
+    }
+
+    static const size_t MAX_BYTES = 4096;
+    char buf[256];
+    size_t total = 0;
+
+    while (total < MAX_BYTES) {
+        size_t to_read = sizeof(buf);
+        if (total + to_read > MAX_BYTES) {
+            to_read = MAX_BYTES - total;
+        }
+        size_t n = fread(buf, 1, to_read, f);
+        if (n == 0) {
+            break;
+        }
+        fwrite(buf, 1, n, stdout);
+        total += n;
+    }
+
+    fclose(f);
+
+    if (total >= MAX_BYTES) {
+        printf("\n[truncated at %zu bytes]\n", MAX_BYTES);
     }
 
     return 0;
@@ -394,9 +463,9 @@ static int cmd_play(int argc, char **argv)
 
     esp_err_t ret = player_play(s_app->player, filename);
     if (ret == ESP_OK) {
-        printf("Playing: %s\n", filename);
+        printf("Play request sent: %s\n", filename);
     } else {
-        printf("Failed to play %s: %s\n", filename, esp_err_to_name(ret));
+        printf("Failed to request play %s: %s\n", filename, esp_err_to_name(ret));
         return 1;
     }
 
@@ -416,7 +485,14 @@ static int cmd_stop(int argc, char **argv)
         return 1;
     }
 
-    printf("Stop command not implemented (use configured stop button)\n");
+    esp_err_t ret = player_stop(s_app->player, true);
+    if (ret == ESP_OK) {
+        printf("Stop request sent\n");
+    } else {
+        printf("Failed to request stop: %s\n", esp_err_to_name(ret));
+        return 1;
+    }
+
     return 0;
 }
 
@@ -474,23 +550,6 @@ static int cmd_volume(int argc, char **argv)
     return 0;
 }
 
-/**
- * @brief 'print_mappings' command handler
- */
-static int cmd_print_mappings(int argc, char **argv)
-{
-    (void)argc;
-    (void)argv;
-
-    if (!s_app->mapper) {
-        printf("Mapper not available\n");
-        return 1;
-    }
-
-    mapper_print_mappings(s_app->mapper);
-    return 0;
-}
-
 // =============================================================================
 // Command Registration
 // =============================================================================
@@ -510,29 +569,21 @@ static void register_all_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&ls_cmd));
 
-    const esp_console_cmd_t cat_mappings_cmd = {
-        .command = "cat_mappings",
-        .help = "Print button-to-sound mappings (internal and external)",
-        .hint = NULL,
-        .func = &cmd_cat_mappings,
+    const esp_console_cmd_t mapping_cmd = {
+        .command = "mapping",
+        .help = "Show loaded mappings or cat raw CSV files",
+        .hint = "[show|cat]",
+        .func = &cmd_mapping,
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&cat_mappings_cmd));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&mapping_cmd));
 
-    const esp_console_cmd_t system_status_cmd = {
-        .command = "system_status",
-        .help = "Show system status (memory, tasks)",
-        .hint = NULL,
-        .func = &cmd_system_status,
+    const esp_console_cmd_t cat_cmd = {
+        .command = "cat",
+        .help = "Dump file contents (max 4096 bytes)",
+        .hint = "<path>",
+        .func = &cmd_cat,
     };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&system_status_cmd));
-
-    const esp_console_cmd_t app_status_cmd = {
-        .command = "application_status",
-        .help = "Show application status (mode, resources, PSRAM logs)",
-        .hint = NULL,
-        .func = &cmd_application_status,
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&app_status_cmd));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cat_cmd));
 
     const esp_console_cmd_t erase_sdcard_cmd = {
         .command = "erase_sdcard",
@@ -580,13 +631,6 @@ static void register_all_commands(void)
     };
     ESP_ERROR_CHECK(esp_console_cmd_register(&volume_cmd));
 
-    const esp_console_cmd_t print_mappings_cmd = {
-        .command = "print_mappings",
-        .help = "Print all loaded button-to-action mappings",
-        .hint = NULL,
-        .func = &cmd_print_mappings,
-    };
-    ESP_ERROR_CHECK(esp_console_cmd_register(&print_mappings_cmd));
 }
 
 // =============================================================================

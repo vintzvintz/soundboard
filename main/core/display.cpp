@@ -15,14 +15,26 @@
 
 static const char *TAG = "display";
 
+// Buffer sizes shared between display_msg_t and display_state_s
+#define DISPLAY_FILENAME_LEN  64
+#define DISPLAY_PAGE_ID_LEN   32
+#define DISPLAY_MSG_LEN       64
+
+// Display task parameters
+#define DISPLAY_QUEUE_DEPTH     10
+#define DISPLAY_TASK_STACK_SIZE 3072
+#define DISPLAY_TASK_PRIORITY   1     // tskIDLE_PRIORITY + 1
+#define DISPLAY_TASK_CORE       0     // PRO_CPU — low priority UI
+
 #define UPDATE_OLED(dest, src) do { \
     strncpy((dest), (src), sizeof(dest) - 1); \
     (dest)[sizeof(dest) - 1] = '\0'; \
 } while (0)
 
 // Display update message types
+// NOTE: ordering matters — display_task() dispatches using >= DISPLAY_MSG_MSC_ANALYSIS
+// to split player-mode vs MSC-mode messages. Keep MSC types grouped at the end.
 typedef enum : uint8_t {
-    DISPLAY_MSG_STARTUP,            // Show startup layout
     DISPLAY_MSG_IDLE,               // Show idle layout
     DISPLAY_MSG_PLAYING,            // Playback started/stopped
     DISPLAY_MSG_VOLUME,             // Volume changed
@@ -30,10 +42,11 @@ typedef enum : uint8_t {
     DISPLAY_MSG_ENCODER_MODE,       // Encoder mode changed (page/volume)
     DISPLAY_MSG_REBOOT,             // Show reboot layout
     DISPLAY_MSG_ERROR,              // Show error layout
+    // --- MSC types must remain below this line ---
     DISPLAY_MSG_MSC_ANALYSIS,       // Show MSC analysis layout
     DISPLAY_MSG_MSC_PROGRESS,       // Show MSC progress layout
     DISPLAY_MSG_MSC_MENU,           // Show MSC interactive menu
-    DISPLAY_MSG_MSC_SD_CLEAR_CONFIRM, // Show MSC SD clear confirmation
+    DISPLAY_MSG_MSC_CONFIRM,         // Show MSC generic confirmation
 } display_msg_type_t;
 
 // Display update message
@@ -41,31 +54,36 @@ typedef struct {
     display_msg_type_t type;
     union {
         struct {
-            char filename[64];  // Empty string means stop
+            char filename[DISPLAY_FILENAME_LEN];  // Empty string means stop
             uint16_t progress;  // 0 = start, UINT16_MAX = end
         } playback;
         struct {
             int volume_index;
         } volume;
         struct {
-            char page_id[32];
+            char page_id[DISPLAY_PAGE_ID_LEN];
         } page;
         struct {
             bool is_page_mode;
         } encoder_mode;
         struct {
-            char message[64];
+            char message[DISPLAY_MSG_LEN];
         } error;
         struct {
-            char status_msg[64];
+            char status_msg[DISPLAY_MSG_LEN];
         } msc_analysis;
         struct {
-            char filename[64];
+            char filename[DISPLAY_FILENAME_LEN];
             uint16_t progress;  // 0 = start, UINT16_MAX = end
         } msc_progress;
         struct {
             int selected_index;
         } msc_menu;
+        struct {
+            char action[20];
+            char line1[DISPLAY_MSG_LEN];
+            char line2[DISPLAY_MSG_LEN];
+        } msc_confirm;
     } data;
 } display_msg_t;
 
@@ -78,7 +96,7 @@ typedef enum : uint8_t {
     LAYOUT_MSC_ANALYSIS,
     LAYOUT_MSC_PROGRESS,
     LAYOUT_MSC_MENU,
-    LAYOUT_MSC_SD_CLEAR_CONFIRM,
+    LAYOUT_MSC_CONFIRM,
     LAYOUT_REBOOT,
     LAYOUT_ERROR,
 } display_layout_t;
@@ -100,14 +118,17 @@ struct display_state_s {
     // Current layout
     display_layout_t current_layout;           // Which layout is currently displayed
 
-    char full_filename[64];                    // Current playback filename
-    uint16_t player_progress;                   // current player progression
-    char msc_status_msg[64];                   // MSC analysis status message
+    char full_filename[DISPLAY_FILENAME_LEN];  // Current playback filename
+    uint16_t player_progress;                  // current player progression
+    char msc_status_msg[DISPLAY_MSG_LEN];      // MSC analysis status message
     int volume_index;                          // Current volume index
-    char current_page[32];                     // Current page string identifier
-    char error_message[64];                    // Error message to display
+    char current_page[DISPLAY_PAGE_ID_LEN];    // Current page string identifier
+    char error_message[DISPLAY_MSG_LEN];       // Error message to display
     uint16_t msc_progress;                     // MSC sync progress (fullscale uint16)
     int msc_menu_selected;                     // MSC menu selected item index (0-2)
+    char confirm_action[20];                   // Confirmation action title
+    char confirm_line1[DISPLAY_MSG_LEN];       // Confirmation message line 1
+    char confirm_line2[DISPLAY_MSG_LEN];       // Confirmation message line 2
 };
 
 // helpers for progress bars
@@ -529,27 +550,38 @@ static void layout_msc_menu(display_handle_t oled, int selected, bool force)
 }
 
 /**
- * @brief Render MSC SD card clear confirmation layout
+ * @brief Render MSC generic confirmation layout
  *
- * Line 1 (8x16, y=0):  "Erase SD card?"
- * Line 3 (6x8,  y=24): "Bottom row btn: confirm"
- * Line 4 (6x8,  y=40): "Other: cancel"
+ * Line 1 (8x16, y=0):  action title (e.g., "ERASE SDCARD", "SYNC BAD DATA")
+ * Line 2 (6x8,  y=24): message line 1
+ * Line 3 (6x8,  y=32): message line 2 (optional)
+ * Line 5 (6x8,  y=48): "Red btn: YES"
+ * Line 6 (6x8,  y=56): "Other:   CANCEL"
  */
-static void layout_msc_sd_clear_confirm(display_handle_t oled)
+static void layout_msc_confirm(display_handle_t oled, const char *action,
+                                const char *line1, const char *line2)
 {
     if (oled == NULL) return;
 
     oled->display->clear();
 
     oled->display->setFixedFont(ssd1306xled_font8x16);
-    oled->display->printFixed(0, 0, "Erase SDcard ?", STYLE_NORMAL);
+    oled->display->printFixed(0, 0, action, STYLE_NORMAL);
 
     oled->display->setFixedFont(ssd1306xled_font6x8);
-    oled->display->printFixed(0, 24, "Red buttons: YES", STYLE_NORMAL);
-    oled->display->printFixed(0, 40, "Other:    CANCEL", STYLE_NORMAL);
+    oled->display->printFixed(0, 24, line1, STYLE_NORMAL);
+    if (line2 != NULL && line2[0] != '\0') {
+        oled->display->printFixed(0, 32, line2, STYLE_NORMAL);
+    }
 
-    oled->current_layout = LAYOUT_MSC_SD_CLEAR_CONFIRM;
-    ESP_LOGD(TAG, "Layout: MSC SD clear confirm");
+    oled->display->printFixed(0, 48, "Red btn: YES", STYLE_NORMAL);
+    oled->display->printFixed(0, 56, "Other:   CANCEL", STYLE_NORMAL);
+
+    UPDATE_OLED(oled->confirm_action, action);
+    UPDATE_OLED(oled->confirm_line1, line1);
+    UPDATE_OLED(oled->confirm_line2, line2 ? line2 : "");
+    oled->current_layout = LAYOUT_MSC_CONFIRM;
+    ESP_LOGD(TAG, "Layout: MSC confirm (%s)", action);
 }
 
 /**
@@ -592,6 +624,107 @@ static void layout_error(display_handle_t oled, const char *message)
 }
 
 /**
+ * @brief Handle player-mode display messages
+ */
+static void handle_player_mode_msg(display_handle_t oled, const display_msg_t *msg)
+{
+    switch (msg->type) {
+        case DISPLAY_MSG_IDLE:
+            layout_idle(oled, oled->current_page, oled->volume_index, true);
+            break;
+
+        case DISPLAY_MSG_PLAYING: {
+            bool is_stop = (msg->data.playback.filename[0] == '\0');
+            if (is_stop) {
+                oled->full_filename[0] = '\0';
+            }
+            if (oled->current_layout != LAYOUT_PAGE_SELECT) {
+                if (is_stop) {
+                    layout_idle(oled, oled->current_page, oled->volume_index, true);
+                } else {
+                    layout_playing(oled, msg->data.playback.filename,
+                                   msg->data.playback.progress, false);
+                }
+            }
+            break;
+        }
+
+        case DISPLAY_MSG_VOLUME:
+            if (oled->current_layout == LAYOUT_IDLE) {
+                layout_idle(oled, oled->current_page, msg->data.volume.volume_index, false);
+            } else {
+                oled->volume_index = msg->data.volume.volume_index;
+            }
+            break;
+
+        case DISPLAY_MSG_PAGE_CHANGED:
+            if (oled->current_layout == LAYOUT_IDLE) {
+                layout_idle(oled, msg->data.page.page_id, oled->volume_index, false);
+            } else if (oled->current_layout == LAYOUT_PAGE_SELECT) {
+                layout_page_select(oled, msg->data.page.page_id, false);
+            } else {
+                UPDATE_OLED(oled->current_page, msg->data.page.page_id);
+            }
+            break;
+
+        case DISPLAY_MSG_ENCODER_MODE:
+            if (msg->data.encoder_mode.is_page_mode) {
+                layout_page_select(oled, oled->current_page, true);
+            } else {
+                if (oled->full_filename[0] != '\0') {
+                    layout_playing(oled, oled->full_filename, oled->player_progress, true);
+                } else {
+                    layout_idle(oled, oled->current_page, oled->volume_index, true);
+                }
+            }
+            break;
+
+        case DISPLAY_MSG_REBOOT:
+            layout_reboot(oled);
+            break;
+
+        case DISPLAY_MSG_ERROR:
+            layout_error(oled, msg->data.error.message);
+            break;
+
+        default:
+            ESP_LOGW(TAG, "Unhandled player message type: %d", msg->type);
+            break;
+    }
+}
+
+/**
+ * @brief Handle MSC-mode display messages
+ */
+static void handle_msc_mode_msg(display_handle_t oled, const display_msg_t *msg)
+{
+    switch (msg->type) {
+        case DISPLAY_MSG_MSC_ANALYSIS:
+            layout_msc_analysis(oled, msg->data.msc_analysis.status_msg, false);
+            break;
+
+        case DISPLAY_MSG_MSC_PROGRESS:
+            layout_msc_progress(oled, msg->data.msc_progress.filename,
+                                msg->data.msc_progress.progress, false);
+            break;
+
+        case DISPLAY_MSG_MSC_MENU:
+            layout_msc_menu(oled, msg->data.msc_menu.selected_index, false);
+            break;
+
+        case DISPLAY_MSG_MSC_CONFIRM:
+            layout_msc_confirm(oled, msg->data.msc_confirm.action,
+                               msg->data.msc_confirm.line1,
+                               msg->data.msc_confirm.line2);
+            break;
+
+        default:
+            ESP_LOGW(TAG, "Unhandled MSC message type: %d", msg->type);
+            break;
+    }
+}
+
+/**
  * @brief Display task - processes update messages from queue
  *
  * Low priority task that blocks on message queue and updates display asynchronously
@@ -604,92 +737,11 @@ static void display_task(void *arg)
     ESP_LOGI(TAG, "Display task started");
 
     while (1) {
-        // Block waiting for messages
         if (xQueueReceive(oled->msg_queue, &msg, portMAX_DELAY) == pdTRUE) {
-            // Process message and render appropriate layout
-            switch (msg.type) {
-                case DISPLAY_MSG_STARTUP:
-                    layout_startup(oled);
-                    break;
-
-                case DISPLAY_MSG_IDLE:
-                    layout_idle(oled, oled->current_page, oled->volume_index, true);
-                    break;
-
-                case DISPLAY_MSG_PLAYING: {
-                    bool is_stop = (msg.data.playback.filename[0] == '\0');
-                    if (is_stop) {
-                        oled->full_filename[0] = '\0';
-                    }
-                    if (oled->current_layout != LAYOUT_PAGE_SELECT) {
-                        if (is_stop) {
-                            layout_idle(oled, oled->current_page, oled->volume_index, true);
-                        } else {
-                            layout_playing(oled, msg.data.playback.filename,
-                                           msg.data.playback.progress, false);
-                        }
-                    }
-                    break;
-                }
-
-                case DISPLAY_MSG_VOLUME:
-                    if (oled->current_layout == LAYOUT_IDLE) {
-                        layout_idle(oled, oled->current_page, msg.data.volume.volume_index, false);
-                    } else {
-                        oled->volume_index = msg.data.volume.volume_index;
-                    }
-                    break;
-
-                case DISPLAY_MSG_PAGE_CHANGED:
-                    if (oled->current_layout == LAYOUT_IDLE) {
-                        layout_idle(oled, msg.data.page.page_id, oled->volume_index, false);
-                    } else if (oled->current_layout == LAYOUT_PAGE_SELECT) {
-                        layout_page_select(oled, msg.data.page.page_id, false);
-                    } else {
-                        UPDATE_OLED(oled->current_page, msg.data.page.page_id);
-                    }
-                    break;
-
-                case DISPLAY_MSG_ENCODER_MODE:
-                    if (msg.data.encoder_mode.is_page_mode) {
-                        layout_page_select(oled, oled->current_page, true);
-                    } else {
-                        if (oled->full_filename[0] != '\0') {
-                            layout_playing(oled, oled->full_filename, oled->player_progress, true);
-                        } else {
-                            layout_idle(oled, oled->current_page, oled->volume_index, true);
-                        }
-                    }
-                    break;
-
-                case DISPLAY_MSG_REBOOT:
-                    layout_reboot(oled);
-                    break;
-
-                case DISPLAY_MSG_ERROR:
-                    layout_error(oled, msg.data.error.message);
-                    break;
-
-                case DISPLAY_MSG_MSC_ANALYSIS:
-                    layout_msc_analysis(oled, msg.data.msc_analysis.status_msg, false);
-                    break;
-
-                case DISPLAY_MSG_MSC_PROGRESS:
-                    layout_msc_progress(oled, msg.data.msc_progress.filename,
-                                        msg.data.msc_progress.progress, false);
-                    break;
-
-                case DISPLAY_MSG_MSC_MENU:
-                    layout_msc_menu(oled, msg.data.msc_menu.selected_index, false);
-                    break;
-
-                case DISPLAY_MSG_MSC_SD_CLEAR_CONFIRM:
-                    layout_msc_sd_clear_confirm(oled);
-                    break;
-
-                default:
-                    ESP_LOGW(TAG, "Unknown message type: %d", msg.type);
-                    break;
+            if (msg.type >= DISPLAY_MSG_MSC_ANALYSIS) {
+                handle_msc_mode_msg(oled, &msg);
+            } else {
+                handle_player_mode_msg(oled, &msg);
             }
         }
     }
@@ -698,22 +750,6 @@ static void display_task(void *arg)
 //
 // Event-driven API functions
 //
-
-extern "C" void display_show_startup(display_handle_t oled)
-{
-    if (oled == NULL || oled->msg_queue == NULL) {
-        return;
-    }
-
-    display_msg_t msg = {
-        .type = DISPLAY_MSG_STARTUP,
-        .data = {}
-    };
-
-    if (xQueueSend(oled->msg_queue, &msg, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Display queue full, dropped startup message");
-    }
-}
 
 extern "C" void display_show_idle(display_handle_t oled)
 {
@@ -912,19 +948,30 @@ extern "C" void display_on_msc_menu(display_handle_t oled, int selected_index)
     }
 }
 
-extern "C" void display_on_msc_sd_clear_confirm(display_handle_t oled)
+extern "C" void display_on_msc_confirm(display_handle_t oled, const char *action,
+                                       const char *line1, const char *line2)
 {
     if (oled == NULL || oled->msg_queue == NULL) {
         return;
     }
 
     display_msg_t msg = {
-        .type = DISPLAY_MSG_MSC_SD_CLEAR_CONFIRM,
-        .data = {}
+        .type = DISPLAY_MSG_MSC_CONFIRM,
+        .data = { .msc_confirm = { .action = {0}, .line1 = {0}, .line2 = {0} } }
     };
 
+    if (action) {
+        strncpy(msg.data.msc_confirm.action, action, sizeof(msg.data.msc_confirm.action) - 1);
+    }
+    if (line1) {
+        strncpy(msg.data.msc_confirm.line1, line1, sizeof(msg.data.msc_confirm.line1) - 1);
+    }
+    if (line2) {
+        strncpy(msg.data.msc_confirm.line2, line2, sizeof(msg.data.msc_confirm.line2) - 1);
+    }
+
     if (xQueueSend(oled->msg_queue, &msg, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Display queue full, dropped MSC SD clear confirm message");
+        ESP_LOGW(TAG, "Display queue full, dropped MSC confirm message");
     }
 }
 
@@ -971,9 +1018,10 @@ extern "C" esp_err_t display_init(const display_config_t *config, display_handle
         return ESP_ERR_NO_MEM;
     }
 
-    // Use default config if none provided
+    // Keep a local copy of configuration
     if (config == NULL) {
         ESP_LOGE(TAG, "display_config parameter cannot be NULL");
+        heap_caps_free(oled);
         return ESP_ERR_INVALID_ARG;
     }
     memcpy(&oled->config, config, sizeof(display_config_t));
@@ -985,7 +1033,7 @@ extern "C" esp_err_t display_init(const display_config_t *config, display_handle
         ESP_LOGE(TAG, "Invalid GPIO pins: SDA=%d, SCL=%d",
                  oled->config.sda_gpio,
                  oled->config.scl_gpio);
-        free(oled);
+        heap_caps_free(oled);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1010,7 +1058,7 @@ extern "C" esp_err_t display_init(const display_config_t *config, display_handle
 
     if (oled->display == NULL) {
         ESP_LOGE(TAG, "Failed to create display object");
-        free(oled);
+        heap_caps_free(oled);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1030,32 +1078,33 @@ extern "C" esp_err_t display_init(const display_config_t *config, display_handle
     oled->msc_progress = 0;
     oled->player_progress = 0;
     oled->msc_menu_selected = 0;
+    memset(oled->confirm_action, 0, sizeof(oled->confirm_action));
+    memset(oled->confirm_line1, 0, sizeof(oled->confirm_line1));
+    memset(oled->confirm_line2, 0, sizeof(oled->confirm_line2));
 
-    // Draw initial startup screen
-    oled->display->setFixedFont(ssd1306xled_font8x16);
-    oled->display->printFixed(0, 8, "Wait USB device", STYLE_NORMAL);
+    // Draw initial startup screen (synchronous)
+    layout_startup(oled);
 
-    // Create message queue (depth=10, large enough for burst updates)
-    oled->msg_queue = xQueueCreate(10, sizeof(display_msg_t));
+    // Create message queue
+    oled->msg_queue = xQueueCreate(DISPLAY_QUEUE_DEPTH, sizeof(display_msg_t));
     if (oled->msg_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create display message queue");
         // Note: Cannot delete display object due to non-virtual destructor in lcdgfx
         // delete oled->display;
         oled->display = NULL;
-        free(oled);
+        heap_caps_free(oled);
         return ESP_ERR_NO_MEM;
     }
 
-    // Create display task (low priority = 1, stack size = 3KB)
-    // Pin to core 0 (PRO_CPU) with USB tasks - low priority UI doesn't need real-time core
+    // Create display task — pinned to PRO_CPU with USB tasks
     BaseType_t task_created = xTaskCreatePinnedToCore(
         display_task,
         "display_task",
-        3072,  // Stack size in bytes
-        oled,  // Pass display handle as parameter
-        1,     // Low priority (tskIDLE_PRIORITY + 1)
+        DISPLAY_TASK_STACK_SIZE,
+        oled,
+        DISPLAY_TASK_PRIORITY,
         &oled->task_handle,
-        0      // Core 0
+        DISPLAY_TASK_CORE
     );
 
     if (task_created != pdPASS) {
@@ -1064,7 +1113,7 @@ extern "C" esp_err_t display_init(const display_config_t *config, display_handle
         // Note: Cannot delete display object due to non-virtual destructor in lcdgfx
         // delete oled->display;
         oled->display = NULL;
-        free(oled);
+        heap_caps_free(oled);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1102,7 +1151,7 @@ extern "C" esp_err_t display_deinit(display_handle_t oled)
     }
 
     // Free the handle itself
-    free(oled);
+    heap_caps_free(oled);
 
     ESP_LOGI(TAG, "Display deinitialized");
 
@@ -1131,7 +1180,7 @@ extern "C" void display_print_status(display_handle_t handle, status_output_type
         case LAYOUT_MSC_ANALYSIS: layout_name = "msc_analysis"; break;
         case LAYOUT_MSC_PROGRESS: layout_name = "msc_progress"; break;
         case LAYOUT_MSC_MENU: layout_name = "msc_menu"; break;
-        case LAYOUT_MSC_SD_CLEAR_CONFIRM: layout_name = "msc_sd_clear_confirm"; break;
+        case LAYOUT_MSC_CONFIRM: layout_name = "msc_confirm"; break;
         case LAYOUT_REBOOT: layout_name = "reboot"; break;
         case LAYOUT_ERROR: layout_name = "error"; break;
     }

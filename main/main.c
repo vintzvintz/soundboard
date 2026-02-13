@@ -10,7 +10,9 @@
  */
 
 #include <inttypes.h>
+#include <limits.h>
 #include <sys/stat.h>
+#include "esp_log_level.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"   // IWYU pragma: keep
 #include "esp_log.h"
@@ -26,6 +28,9 @@
 
 
 static const char *TAG = "soundboard";
+
+/** Main loop tick interval — how often to check for MSC notifications */
+#define MAIN_LOOP_TICK_MS 1000
 
 // SPIFFS uses hardcoded filename
 // not a kconfig option because it must match filename in spiffs/ project directory
@@ -54,6 +59,9 @@ static void set_loglevels(void)
     //esp_log_level_set("audio_provider", ESP_LOG_DEBUG);
     //esp_log_level_set("msc", ESP_LOG_DEBUG);
     //esp_log_level_set("input_scanner", ESP_LOG_DEBUG);
+#ifdef CONFIG_SOUNDBOARD_IO_STATS_ENABLE
+    //esp_log_level_set("benchmark", ESP_LOG_DEBUG);
+#endif
 }
 
 
@@ -101,27 +109,26 @@ static void msc_event_callback(const msc_event_data_t *event_data, void *user_ct
     display_handle_t oled = s_app_state.oled;
 
     switch (event_data->type) {
-        case MSC_EVENT_READY:
-            display_on_msc_analysis(oled, "Ready");
+        case MSC_EVENT_ANALYSIS:
+            display_on_msc_analysis(oled, event_data->analysis.status_msg);
             break;
-        case MSC_EVENT_MENU_FULL_SELECTED:
-            display_on_msc_menu(oled, 0);
-            break;
-        case MSC_EVENT_MENU_INCREMENTAL_SELECTED:
-            display_on_msc_menu(oled, 1);
+        case MSC_EVENT_MENU_UPDATE_SELECTED:
+            display_on_msc_menu(oled, event_data->menu.incremental ? 1 : 0);
             break;
         case MSC_EVENT_MENU_SD_CLEAR_SELECTED:
             display_on_msc_menu(oled, 2);
             break;
-        case MSC_EVENT_MENU_SD_CLEAR_CONFIRM:
-            display_on_msc_sd_clear_confirm(oled);
+        case MSC_EVENT_CONFIRM:
+            display_on_msc_confirm(oled, event_data->confirm.action,
+                                   event_data->confirm.line1,
+                                   event_data->confirm.line2);
             break;
         case MSC_EVENT_UPDATING:
             display_on_msc_progress(oled, event_data->progress.filename,
                                     event_data->progress.progress);
             break;
         case MSC_EVENT_UPDATE_DONE:
-            display_on_msc_progress(oled, "Done", UINT16_MAX);
+            display_on_msc_progress(oled, "Done. Unplug USB", UINT16_MAX);
             break;
         case MSC_EVENT_UPDATE_FAILED:
             display_on_error(oled, event_data->error.message);
@@ -254,10 +261,10 @@ static void input_scanner_callback(uint8_t btn_num, input_event_type_t event, vo
 
     switch(s_app_state.mode){
         case APP_MODE_PLAYER:
-            mapper_handle_event(s_app_state.mapper, btn_num, event);
+            mapper_on_input_event(s_app_state.mapper, btn_num, event);
             break;
         case APP_MODE_MSC:
-            msc_handle_input_event(s_app_state.msc, btn_num, event);
+            msc_on_input_event(s_app_state.msc, btn_num, event);
             break;
         case APP_MODE_NONE:
         default:
@@ -534,25 +541,22 @@ void app_print_status(status_output_type_t output_type)
         case APP_MODE_MSC: mode_str = "MSC"; break;
     }
 
+    const char *config_src = "NONE";
+    switch (s_app_state.config_source) {
+        case CONFIG_SOURCE_FIRMWARE: config_src = "SPIFFS"; break;
+        case CONFIG_SOURCE_SDCARD: config_src = "SD Card"; break;
+        default: break;
+    }
+
     if (output_type == STATUS_OUTPUT_COMPACT) {
-        printf("[app] mode=%s\n", mode_str);
+        printf("[app] mode=%s, config=%s\n", mode_str, config_src);
     } else {
         printf("Application Status:\n");
         printf("  Mode: %s\n", mode_str);
-        printf("  Free heap: %lu bytes\n", (unsigned long)esp_get_free_heap_size());
+        printf("  Config source: %s\n", config_src);
 
         if (output_type == STATUS_OUTPUT_VERBOSE) {
-            printf("  Min free heap: %lu bytes\n", (unsigned long)esp_get_minimum_free_heap_size());
             printf("  Uptime: %" PRId64 " s\n", esp_timer_get_time() / 1000000);
-
-            // Configuration source
-            const char *config_src = "NONE";
-            switch (s_app_state.config_source) {
-                case CONFIG_SOURCE_FIRMWARE: config_src = "SPIFFS"; break;
-                case CONFIG_SOURCE_SDCARD: config_src = "SD Card"; break;
-                default: break;
-            }
-            printf("  Config source: %s\n", config_src);
         }
     }
 }
@@ -570,9 +574,6 @@ void app_main(void)
     // Phase 1: Display (early init for startup screen)
     // -------------------------------------------------------------------------
     init_display(&s_app_state.oled);  // NON-FATAL
-    if (s_app_state.oled != NULL) {
-        display_show_startup(s_app_state.oled);
-    }
 
     // -------------------------------------------------------------------------
     // Phase 2: Storage subsystems
@@ -627,24 +628,12 @@ void app_main(void)
     app_set_mode(APP_MODE_PLAYER);
     ESP_LOGI(TAG, "=== Soundboard Ready ===");
 
-    // Print compact status of all modules after init
-    ESP_LOGI(TAG, "=== System Status ===");
-    app_print_status(STATUS_OUTPUT_COMPACT);
-    sd_card_print_status(STATUS_OUTPUT_COMPACT);
-    persistent_volume_print_status(STATUS_OUTPUT_COMPACT);
-    display_print_status(s_app_state.oled, STATUS_OUTPUT_COMPACT);
-    input_scanner_print_status(s_app_state.input_scanner, STATUS_OUTPUT_COMPACT);
-    mapper_print_status(s_app_state.mapper, STATUS_OUTPUT_COMPACT);
-    player_print_status(s_app_state.player, STATUS_OUTPUT_COMPACT);
-    msc_print_status(s_app_state.msc, STATUS_OUTPUT_COMPACT);
-    ESP_LOGI(TAG, "=====================");
-
     // -------------------------------------------------------------------------
     // Main event loop - wait for MSC notifications
     // -------------------------------------------------------------------------
     while (1) {
         uint32_t notify_value = 0;
-        xTaskNotifyWait(0, 0xFFFFFFFF, &notify_value, pdMS_TO_TICKS(1000));
+        xTaskNotifyWait(0, ULONG_MAX, &notify_value, pdMS_TO_TICKS(MAIN_LOOP_TICK_MS));
 
         if (notify_value & MSC_NOTIFY_DISCONNECTED) {
             ESP_LOGW(TAG, "MSC device disconnected - rebooting...");

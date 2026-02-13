@@ -22,7 +22,6 @@ static const char *TAG = "persistent_volume";
 
 // Module state
 static esp_timer_handle_t s_save_timer = NULL;
-static uint16_t s_pending_curve = 0;
 static uint16_t s_pending_index = 0;
 static bool s_initialized = false;
 
@@ -42,10 +41,7 @@ static void save_timer_callback(void *arg)
         return;
     }
 
-    // Pack curve and index into single 32-bit value
-    uint32_t packed = ((uint32_t)s_pending_curve << 16) | ((uint32_t)s_pending_index & 0xFFFF);
-
-    ret = nvs_set_u32(handle, NVS_VOLUME_KEY, packed);
+    ret = nvs_set_u16(handle, NVS_VOLUME_KEY, s_pending_index);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write volume: %s", esp_err_to_name(ret));
         nvs_close(handle);
@@ -60,7 +56,7 @@ static void save_timer_callback(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "Saved volume: curve=%u, index=%u", s_pending_curve, s_pending_index);
+    ESP_LOGI(TAG, "Saved volume: index=%u", s_pending_index);
 }
 
 esp_err_t persistent_volume_init(void)
@@ -88,9 +84,9 @@ esp_err_t persistent_volume_init(void)
     return ESP_OK;
 }
 
-esp_err_t persistent_volume_load(uint16_t *curve, uint16_t *index)
+esp_err_t persistent_volume_load(uint16_t *index)
 {
-    if (curve == NULL || index == NULL) {
+    if (index == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -98,11 +94,9 @@ esp_err_t persistent_volume_load(uint16_t *curve, uint16_t *index)
     esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         // Namespace doesn't exist yet (first boot) - use defaults
-        ESP_LOGI(TAG, "No saved volume (first boot), using defaults (curve=%d, index=%d)",
-                 PERSISTENT_VOLUME_DEFAULT_CURVE, PERSISTENT_VOLUME_DEFAULT_INDEX);
-        *curve = PERSISTENT_VOLUME_DEFAULT_CURVE;
+        ESP_LOGI(TAG, "No saved volume (first boot), using default index=%d",
+                 PERSISTENT_VOLUME_DEFAULT_INDEX);
         *index = PERSISTENT_VOLUME_DEFAULT_INDEX;
-        s_pending_curve = *curve;
         s_pending_index = *index;
         return ESP_OK;
     }
@@ -111,17 +105,15 @@ esp_err_t persistent_volume_load(uint16_t *curve, uint16_t *index)
         return ESP_FAIL;
     }
 
-    uint32_t packed = 0;
-    ret = nvs_get_u32(handle, NVS_VOLUME_KEY, &packed);
+    uint16_t saved = 0;
+    ret = nvs_get_u16(handle, NVS_VOLUME_KEY, &saved);
     nvs_close(handle);
 
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         // Key doesn't exist - use defaults
-        ESP_LOGI(TAG, "No saved volume, using defaults (curve=%d, index=%d)",
-                 PERSISTENT_VOLUME_DEFAULT_CURVE, PERSISTENT_VOLUME_DEFAULT_INDEX);
-        *curve = PERSISTENT_VOLUME_DEFAULT_CURVE;
+        ESP_LOGI(TAG, "No saved volume, using default index=%d",
+                 PERSISTENT_VOLUME_DEFAULT_INDEX);
         *index = PERSISTENT_VOLUME_DEFAULT_INDEX;
-        s_pending_curve = *curve;
         s_pending_index = *index;
         return ESP_OK;
     }
@@ -130,27 +122,21 @@ esp_err_t persistent_volume_load(uint16_t *curve, uint16_t *index)
         return ESP_FAIL;
     }
 
-    // Unpack curve (upper 16 bits) and index (lower 16 bits)
-    *curve = (uint16_t)(packed >> 16);
-    *index = (uint16_t)(packed & 0xFFFF);
-
-    // Update module state so print_status reports correct values
-    s_pending_curve = *curve;
+    *index = saved;
     s_pending_index = *index;
 
-    ESP_LOGI(TAG, "Loaded volume: curve=%u, index=%u", *curve, *index);
+    ESP_LOGI(TAG, "Loaded volume: index=%u", *index);
     return ESP_OK;
 }
 
-esp_err_t persistent_volume_save_deferred(uint16_t curve, uint16_t index)
+esp_err_t persistent_volume_save_deferred(uint16_t index)
 {
     if (!s_initialized || s_save_timer == NULL) {
         ESP_LOGW(TAG, "Module not initialized, cannot save");
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Store pending values
-    s_pending_curve = curve;
+    // Store pending value
     s_pending_index = index;
 
     // Stop timer if running (reset for new delay)
@@ -163,7 +149,7 @@ esp_err_t persistent_volume_save_deferred(uint16_t curve, uint16_t index)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Deferred save scheduled: curve=%u, index=%u", curve, index);
+    ESP_LOGI(TAG, "Deferred save scheduled: index=%u", index);
     return ESP_OK;
 }
 

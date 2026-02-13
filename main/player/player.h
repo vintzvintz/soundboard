@@ -11,7 +11,6 @@
 
 // Player configuration from Kconfig
 #define CACHE_SIZE_KB CONFIG_SOUNDBOARD_PLAYER_CACHE_SIZE_KB
-#define FILENAME_MAX_LENGTH CONFIG_SOUNDBOARD_PLAYER_FILENAME_MAX_LENGTH
 
 // Forward declarations
 typedef struct player_s* player_handle_t;
@@ -55,11 +54,6 @@ typedef void (*player_event_callback_t)(const player_event_data_t *event_data, v
 /**
  * @brief Player module configuration structure
  */
-/**
- * @brief Opaque handle to player instance
- */
-typedef struct player_s* player_handle_t;
-
 typedef struct {
     size_t cache_size_kb;                /**< Cache size in KB (0 = disabled, >0 = enabled, requires PSRAM) */
     player_event_callback_t event_cb;    /**< to notify player state changes to other modules (e.g. display)*/

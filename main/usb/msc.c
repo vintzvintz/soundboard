@@ -23,13 +23,20 @@
 #include "mapper.h"
 #include "msc.h"
 
+#ifdef CONFIG_SOUNDBOARD_IO_STATS_ENABLE
+    #include "benchmark.h"
+#endif
+
+
 static const char *TAG = "msc";
 
 // Mount points and paths
 #define MSC_SOUNDBOARD_DIR   MSC_MOUNT_POINT "/" CONFIG_SOUNDBOARD_MSC_ROOT_DIR
 #define MAPPINGS_FILENAME    CONFIG_SOUNDBOARD_MAPPINGS_FILENAME
 #define MSC_MAPPINGS_PATH    MSC_SOUNDBOARD_DIR "/" MAPPINGS_FILENAME
-#define MSC_MAX_PATH_LEN     256
+
+// Display-friendly filename buffer (truncated for OLED/console output)
+#define MSC_DISPLAY_FILENAME_LEN 64
 
 // Minimum time between progress updates (milliseconds)
 #define PROGRESS_UPDATE_MIN_INTERVAL_MS 100
@@ -37,22 +44,24 @@ static const char *TAG = "msc";
 // Internal event queue depth
 #define MSC_EVENT_QUEUE_DEPTH 8
 
+// Task configuration
+#define USB_LIB_TASK_STACK_SIZE  4096
+#define USB_LIB_TASK_PRIORITY    5
+#define USB_LIB_TASK_CORE        0
+#define MSC_FSM_TASK_STACK_SIZE  6144
+#define MSC_FSM_TASK_PRIORITY    2
+#define MSC_FSM_TASK_CORE        0
+
 /* ============================================================================
  * FSM State Enum
  * ============================================================================ */
 
 typedef enum {
     MSC_STATE_WAIT_MSC,
-    MSC_STATE_INIT,
-    MSC_STATE_MENU_UPDATE_FULL,
-    MSC_STATE_MENU_UPDATE_INCREMENTAL,
+    MSC_STATE_MENU_UPDATE,
     MSC_STATE_MENU_SD_CLEAR,
-    MSC_STATE_MENU_SD_CLEAR_CONFIRM,
-    MSC_STATE_UPDATING_FULL,
-    MSC_STATE_UPDATING_INCREMENTAL,
-    MSC_STATE_UPDATING_SD_CLEAR,
-    MSC_STATE_UPDATE_DONE,
-    MSC_STATE_UPDATE_FAILED,
+    MSC_STATE_CONFIRM,
+    MSC_STATE_END,
 } msc_fsm_state_t;
 
 /* ============================================================================
@@ -91,11 +100,16 @@ struct msc_s {
     size_t done_bytes;
     int total_files;
     int done_files;
-    char current_filename[64];
+    char current_filename[MSC_DISPLAY_FILENAME_LEN];
     TickType_t last_progress_update;
 
     // FSM
     msc_fsm_state_t state;
+    bool incremental;
+    enum {
+        CONFIRM_ACTION_SD_CLEAR,
+        CONFIRM_ACTION_SYNC_BAD_DATA,
+    } confirm_action;
     QueueHandle_t event_queue;
     TaskHandle_t fsm_task;
     TaskHandle_t usb_lib_task;
@@ -138,6 +152,18 @@ static void notify_progress(msc_handle_t h)
     h->event_cb(&data, h->event_cb_ctx);
 }
 
+static void notify_menu_update(msc_handle_t h, bool incremental)
+{
+    if (h == NULL || h->event_cb == NULL) {
+        return;
+    }
+    msc_event_data_t data = {
+        .type = MSC_EVENT_MENU_UPDATE_SELECTED,
+        .menu = { .incremental = incremental },
+    };
+    h->event_cb(&data, h->event_cb_ctx);
+}
+
 static void notify_error(msc_handle_t h, const char *message)
 {
     if (h == NULL || h->event_cb == NULL) {
@@ -146,6 +172,31 @@ static void notify_error(msc_handle_t h, const char *message)
     msc_event_data_t data = {
         .type = MSC_EVENT_UPDATE_FAILED,
         .error = { .message = message },
+    };
+    h->event_cb(&data, h->event_cb_ctx);
+}
+
+static void notify_analysis(msc_handle_t h, const char *status_msg)
+{
+    if (h == NULL || h->event_cb == NULL) {
+        return;
+    }
+    msc_event_data_t data = {
+        .type = MSC_EVENT_ANALYSIS,
+        .analysis = { .status_msg = status_msg },
+    };
+    h->event_cb(&data, h->event_cb_ctx);
+}
+
+static void notify_confirm(msc_handle_t h, const char *action,
+                            const char *line1, const char *line2)
+{
+    if (h == NULL || h->event_cb == NULL) {
+        return;
+    }
+    msc_event_data_t data = {
+        .type = MSC_EVENT_CONFIRM,
+        .confirm = { .action = action, .line1 = line1, .line2 = line2 },
     };
     h->event_cb(&data, h->event_cb_ctx);
 }
@@ -226,7 +277,7 @@ static esp_err_t uninstall_device(msc_handle_t handle)
 }
 
 /* ============================================================================
- * File Copy Functions (unchanged from previous implementation)
+ * File Copy Functions 
  * ============================================================================ */
 
 static void update_copy_progress(msc_handle_t handle, size_t bytes_copied)
@@ -272,8 +323,25 @@ static esp_err_t copy_file(const char *src, const char *dst, msc_handle_t handle
     size_t bytes_read;
     size_t file_bytes = 0;
 
-    while ((bytes_read = fread(buffer, 1, copy_buf_size, src_file)) > 0) {
+    while (true) {
+#ifdef IO_STATS_ENABLE
+        int64_t t0 = benchmark_start();
+#endif
+        bytes_read = fread(buffer, 1, copy_buf_size, src_file);
+#ifdef IO_STATS_ENABLE
+        benchmark_record(BENCH_MSC_READ, t0, bytes_read);
+#endif
+        if (bytes_read == 0) {
+            break;
+        }
+
+#ifdef IO_STATS_ENABLE
+        t0 = benchmark_start();
+#endif
         size_t bytes_written = fwrite(buffer, 1, bytes_read, dst_file);
+#ifdef IO_STATS_ENABLE
+        benchmark_record(BENCH_MSC_WRITE, t0, bytes_written);
+#endif
         if (bytes_written != bytes_read) {
             ESP_LOGE(TAG, "Write error copying %s to %s", src, dst);
             ret = ESP_FAIL;
@@ -283,13 +351,17 @@ static esp_err_t copy_file(const char *src, const char *dst, msc_handle_t handle
         update_copy_progress(handle, bytes_written);
     }
 
-    free(buffer);
+    heap_caps_free(buffer);
     fclose(src_file);
     fclose(dst_file);
 
     if (ret == ESP_OK) {
         handle->done_files++;
         ESP_LOGI(TAG, "Copied %s -> %s (%zu bytes)", src, dst, file_bytes);
+#ifdef IO_STATS_ENABLE
+        benchmark_log_and_reset(BENCH_MSC_READ, dst);
+        benchmark_log_and_reset(BENCH_MSC_WRITE, dst);
+#endif
     }
 
     return ret;
@@ -307,148 +379,25 @@ static bool is_sync_file(const char *name)
     return is_wav_file(name) || (strcasecmp(name, MAPPINGS_FILENAME) == 0);
 }
 
-static esp_err_t scan_files_for_sync(const char *msc_root, msc_handle_t handle)
-{
-    DIR *dir = opendir(msc_root);
-    if (dir == NULL) {
-        ESP_LOGE(TAG, "Failed to open directory: %s", msc_root);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    handle->total_files = 0;
-    handle->total_bytes = 0;
-    handle->done_files = 0;
-    handle->done_bytes = 0;
-
-    struct dirent *entry;
-    struct stat st;
-    char path[MSC_MAX_PATH_LEN + 64];
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_DIR || !is_sync_file(entry->d_name)) {
-            continue;
-        }
-
-        snprintf(path, sizeof(path), "%s/%s", msc_root, entry->d_name);
-        if (stat(path, &st) == 0) {
-            handle->total_files++;
-            handle->total_bytes += st.st_size;
-            ESP_LOGD(TAG, "Found: %s (%ld bytes)", entry->d_name, (long)st.st_size);
-        }
-    }
-
-    closedir(dir);
-    ESP_LOGI(TAG, "Scan complete: %d files, %zu bytes total",
-             handle->total_files, handle->total_bytes);
-    return ESP_OK;
-}
-
-static esp_err_t copy_files_to_sdcard(const char *msc_root, const char *sdcard_root,
-                                       msc_handle_t handle)
-{
-    if (msc_root == NULL || sdcard_root == NULL || handle == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t ret = scan_files_for_sync(msc_root, handle);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    if (handle->total_files == 0) {
-        ESP_LOGW(TAG, "No files to copy");
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "Copying %d files from %s to %s...",
-             handle->total_files, msc_root, sdcard_root);
-
-    DIR *dir = opendir(msc_root);
-    if (dir == NULL) {
-        ESP_LOGE(TAG, "Failed to open directory: %s", msc_root);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    ret = ESP_OK;
-    struct dirent *entry;
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_DIR || !is_sync_file(entry->d_name)) {
-            continue;
-        }
-
-        strncpy(handle->current_filename, entry->d_name,
-                sizeof(handle->current_filename) - 1);
-        handle->current_filename[sizeof(handle->current_filename) - 1] = '\0';
-
-        char src_path[MSC_MAX_PATH_LEN + 64];
-        char dst_path[MSC_MAX_PATH_LEN + 64];
-        snprintf(src_path, sizeof(src_path), "%s/%s", msc_root, entry->d_name);
-        snprintf(dst_path, sizeof(dst_path), "%s/%s", sdcard_root, entry->d_name);
-
-        esp_err_t copy_ret = copy_file(src_path, dst_path, handle);
-        if (copy_ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to copy %s: %s", entry->d_name, esp_err_to_name(copy_ret));
-            ret = copy_ret;
-        }
-    }
-
-    closedir(dir);
-    ESP_LOGI(TAG, "File copy complete: %d/%d files copied",
-             handle->done_files, handle->total_files);
-    return ret;
-}
-
-/* ============================================================================
- * Full Update Workflow
- * ============================================================================ */
-
-static esp_err_t run_full_update(msc_handle_t handle)
-{
-    ESP_LOGI(TAG, "Running full update...");
-
-    // Check SD card is mounted
-    struct stat st;
-    if (stat(SDCARD_MOUNT_POINT, &st) != 0) {
-        ESP_LOGE(TAG, "SD card not mounted at %s", SDCARD_MOUNT_POINT);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Copy files
-    esp_err_t ret = copy_files_to_sdcard(MSC_SOUNDBOARD_DIR, SDCARD_MOUNT_POINT, handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Full update failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "Full update complete");
-    return ESP_OK;
-}
-
-/* ============================================================================
- * Incremental Update Workflow
- * ============================================================================ */
-
-/**
- * @brief Check if a WAV file on SD card matches the USB source by size
- *
- * @return true if file exists on SD card with the same size as msc_size
- */
 static bool sdcard_file_matches(const char *filename, off_t msc_size)
 {
-    char path[MSC_MAX_PATH_LEN + 64];
+    char path[SOUNDBOARD_MAX_PATH_LEN];
     snprintf(path, sizeof(path), "%s/%s", SDCARD_MOUNT_POINT, filename);
     struct stat sd_st;
     return (stat(path, &sd_st) == 0 && sd_st.st_size == msc_size);
 }
 
 /**
- * @brief Scan USB files for incremental sync.
+ * @brief Process sync-eligible files: scan only (count/sum) or copy to SD card.
  *
- * Counts total bytes to copy: always includes mappings.csv,
- * skips WAV files that already exist on SD card with the same size.
+ * Iterates msc_root, skipping directories, non-sync files, and (when incremental)
+ * WAV files that already exist on SD card with matching size.
+ *
+ * When scan_only is true, counts files and sums sizes into handle totals.
+ * When scan_only is false, copies each matching file to SDCARD_MOUNT_POINT.
  */
-static esp_err_t scan_files_for_incremental(const char *msc_root, msc_handle_t handle)
+static esp_err_t process_sync_files(const char *msc_root, bool incremental,
+                                    bool scan_only, msc_handle_t handle)
 {
     DIR *dir = opendir(msc_root);
     if (dir == NULL) {
@@ -456,14 +405,17 @@ static esp_err_t scan_files_for_incremental(const char *msc_root, msc_handle_t h
         return ESP_ERR_NOT_FOUND;
     }
 
-    handle->total_files = 0;
-    handle->total_bytes = 0;
-    handle->done_files = 0;
-    handle->done_bytes = 0;
+    if (scan_only) {
+        handle->total_files = 0;
+        handle->total_bytes = 0;
+        handle->done_files = 0;
+        handle->done_bytes = 0;
+    }
 
+    esp_err_t ret = ESP_OK;
     struct dirent *entry;
     struct stat st;
-    char path[MSC_MAX_PATH_LEN + 64];
+    char src_path[SOUNDBOARD_MAX_PATH_LEN];
     int skipped = 0;
 
     while ((entry = readdir(dir)) != NULL) {
@@ -471,128 +423,79 @@ static esp_err_t scan_files_for_incremental(const char *msc_root, msc_handle_t h
             continue;
         }
 
-        snprintf(path, sizeof(path), "%s/%s", msc_root, entry->d_name);
-        if (stat(path, &st) != 0) {
-            continue;
-        }
-
-        // Skip WAV files that exist on SD card with matching size
-        if (is_wav_file(entry->d_name) && sdcard_file_matches(entry->d_name, st.st_size)) {
-            ESP_LOGI(TAG, "Skip (same size): %s (%ld bytes)", entry->d_name, (long)st.st_size);
-            skipped++;
-            continue;
-        }
-
-        handle->total_files++;
-        handle->total_bytes += st.st_size;
-        ESP_LOGD(TAG, "Will copy: %s (%ld bytes)", entry->d_name, (long)st.st_size);
-    }
-
-    closedir(dir);
-    ESP_LOGI(TAG, "Incremental scan: %d files to copy, %d skipped, %zu bytes total",
-             handle->total_files, skipped, handle->total_bytes);
-    return ESP_OK;
-}
-
-/**
- * @brief Copy files from USB to SD card incrementally.
- *
- * Always overwrites mappings.csv. Only copies WAV files that are new
- * or have a different size than the SD card copy.
- */
-static esp_err_t copy_files_incremental(const char *msc_root, const char *sdcard_root,
-                                         msc_handle_t handle)
-{
-    if (msc_root == NULL || sdcard_root == NULL || handle == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t ret = scan_files_for_incremental(msc_root, handle);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    if (handle->total_files == 0) {
-        ESP_LOGI(TAG, "No new files to copy");
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "Incremental copy: %d files from %s to %s...",
-             handle->total_files, msc_root, sdcard_root);
-
-    DIR *dir = opendir(msc_root);
-    if (dir == NULL) {
-        ESP_LOGE(TAG, "Failed to open directory: %s", msc_root);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    ret = ESP_OK;
-    struct dirent *entry;
-    struct stat st;
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type == DT_DIR || !is_sync_file(entry->d_name)) {
-            continue;
-        }
-
-        char src_path[MSC_MAX_PATH_LEN + 64];
         snprintf(src_path, sizeof(src_path), "%s/%s", msc_root, entry->d_name);
         if (stat(src_path, &st) != 0) {
             continue;
         }
 
-        // Skip WAV files that exist on SD card with matching size
-        if (is_wav_file(entry->d_name) && sdcard_file_matches(entry->d_name, st.st_size)) {
+        if (incremental && is_wav_file(entry->d_name) &&
+            sdcard_file_matches(entry->d_name, st.st_size)) {
+            skipped++;
             continue;
         }
 
-        strncpy(handle->current_filename, entry->d_name,
-                sizeof(handle->current_filename) - 1);
-        handle->current_filename[sizeof(handle->current_filename) - 1] = '\0';
+        if (scan_only) {
+            handle->total_files++;
+            handle->total_bytes += st.st_size;
+            ESP_LOGD(TAG, "Found: %s (%ld bytes)", entry->d_name, (long)st.st_size);
+        } else {
+            strncpy(handle->current_filename, entry->d_name,
+                    sizeof(handle->current_filename) - 1);
+            handle->current_filename[sizeof(handle->current_filename) - 1] = '\0';
 
-        char dst_path[MSC_MAX_PATH_LEN + 64];
-        snprintf(dst_path, sizeof(dst_path), "%s/%s", sdcard_root, entry->d_name);
+            char dst_path[SOUNDBOARD_MAX_PATH_LEN];
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", SDCARD_MOUNT_POINT, entry->d_name);
 
-        esp_err_t copy_ret = copy_file(src_path, dst_path, handle);
-        if (copy_ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to copy %s: %s", entry->d_name, esp_err_to_name(copy_ret));
-            ret = copy_ret;
+            ret = copy_file(src_path, dst_path, handle);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to copy %s: %s", entry->d_name, esp_err_to_name(ret));
+                break;
+            }
         }
     }
 
     closedir(dir);
-    ESP_LOGI(TAG, "Incremental copy complete: %d/%d files copied",
-             handle->done_files, handle->total_files);
+
+    if (scan_only) {
+        ESP_LOGI(TAG, "Scan complete: %d files to copy, %d skipped, %zu bytes total",
+                 handle->total_files, skipped, handle->total_bytes);
+    }
     return ret;
 }
 
-static esp_err_t run_incremental_update(msc_handle_t handle)
+static esp_err_t run_update(msc_handle_t handle, bool incremental)
 {
-    ESP_LOGI(TAG, "Running incremental update...");
+    const char *mode = incremental ? "incremental" : "full";
+    ESP_LOGI(TAG, "Running %s update...", mode);
 
-    // Check SD card is mounted
-    struct stat st;
-    if (stat(SDCARD_MOUNT_POINT, &st) != 0) {
+    struct stat dir_st;
+    if (stat(SDCARD_MOUNT_POINT, &dir_st) != 0) {
         ESP_LOGE(TAG, "SD card not mounted at %s", SDCARD_MOUNT_POINT);
         return ESP_ERR_INVALID_STATE;
     }
 
-    // Validate mappings.csv on USB (syntax + referenced audio files)
-    esp_err_t ret = mapper_validate_file(MSC_MAPPINGS_PATH, MSC_SOUNDBOARD_DIR, true);
+    esp_err_t ret = process_sync_files(MSC_SOUNDBOARD_DIR, incremental, true, handle);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Incremental update: mappings validation failed");
         return ret;
     }
 
-    // Copy: always overwrite mappings.csv, skip existing WAV files
-    ret = copy_files_incremental(MSC_SOUNDBOARD_DIR, SDCARD_MOUNT_POINT, handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Incremental update failed: %s", esp_err_to_name(ret));
-        return ret;
+    if (handle->total_files == 0) {
+        ESP_LOGI(TAG, "No files to copy");
+        return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "Incremental update complete");
-    return ESP_OK;
+    ESP_LOGI(TAG, "Copying %d files from %s to %s...",
+             handle->total_files, MSC_SOUNDBOARD_DIR, SDCARD_MOUNT_POINT);
+
+    ret = process_sync_files(MSC_SOUNDBOARD_DIR, incremental, false, handle);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "%s update complete: %d/%d files copied",
+                 mode, handle->done_files, handle->total_files);
+    } else {
+        ESP_LOGE(TAG, "%s update failed: %s", mode, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 /* ============================================================================
@@ -614,19 +517,25 @@ static void drain_queue(msc_handle_t handle)
  * USB Content Validation (stub)
  * ============================================================================ */
 
-static esp_err_t validate_usb_content(void)
+static esp_err_t validate_usb_content(char *err_msg, size_t err_msg_len)
 {
     // Check /msc/soundboard directory exists
     struct stat dir_st;
     if (stat(MSC_SOUNDBOARD_DIR, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) {
         ESP_LOGE(TAG, "Directory not found: %s", MSC_SOUNDBOARD_DIR);
+        snprintf(err_msg, err_msg_len, "Dir not found");
         return ESP_ERR_NOT_FOUND;
     }
 
     // Validate mappings CSV syntax and check referenced audio files exist on USB
     esp_err_t ret = mapper_validate_file(MSC_MAPPINGS_PATH, MSC_SOUNDBOARD_DIR, true);
+    if (ret == ESP_ERR_NOT_FOUND) {
+        snprintf(err_msg, err_msg_len, "No mappings.csv");
+        return ret;
+    }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Mappings validation failed");
+        snprintf(err_msg, err_msg_len, "Bad mappings.csv");
         return ret;
     }
 
@@ -645,87 +554,73 @@ static void fsm_handle_init(msc_handle_t h, uint8_t device_address)
     esp_err_t ret = mount_device(device_address, h);
     if (ret != ESP_OK) {
         notify_error(h, "Mount failed");
-        h->state = MSC_STATE_UPDATE_FAILED;
+        h->state = MSC_STATE_END;
         return;
     }
 
-    ret = validate_usb_content();
-    if (ret != ESP_OK) {
-        notify_error(h, "Invalid USB content");
-        unmount_vfs(h);
-        h->state = MSC_STATE_UPDATE_FAILED;
-        return;
-    }
-
-    notify_event_simple(h, MSC_EVENT_READY);
-
-    // Enter first menu item
-    h->state = MSC_STATE_MENU_UPDATE_FULL;
-    notify_event_simple(h, MSC_EVENT_MENU_FULL_SELECTED);
+    h->incremental = false;
+    h->state = MSC_STATE_MENU_UPDATE;
+    notify_menu_update(h, false);
 }
 
-static void fsm_handle_menu_full(msc_handle_t h, const msc_internal_event_t *evt)
+static void fsm_handle_menu_update(msc_handle_t h, const msc_internal_event_t *evt)
 {
     if (evt->type != MSC_INTERNAL_INPUT_EVENT) {
         return;
     }
 
     if (evt->input.event == INPUT_EVENT_ENCODER_ROTATE_CW) {
-        h->state = MSC_STATE_MENU_UPDATE_INCREMENTAL;
-        notify_event_simple(h, MSC_EVENT_MENU_INCREMENTAL_SELECTED);
-    } else if (evt->input.event == INPUT_EVENT_ENCODER_ROTATE_CCW) {
-        h->state = MSC_STATE_MENU_SD_CLEAR;
-        notify_event_simple(h, MSC_EVENT_MENU_SD_CLEAR_SELECTED);
-    } else if (evt->input.event == INPUT_EVENT_BUTTON_PRESS && evt->input.btn_num == 0) {
-        // Encoder switch press → launch full update
-        h->state = MSC_STATE_UPDATING_FULL;
-        strncpy(h->current_filename, "Scanning...", sizeof(h->current_filename) - 1);
-        notify_progress(h);
-
-        esp_err_t ret = run_full_update(h);
-        drain_queue(h);
-
-        if (ret == ESP_OK) {
-            h->state = MSC_STATE_UPDATE_DONE;
-            unmount_vfs(h);
-            notify_event_simple(h, MSC_EVENT_UPDATE_DONE);
+        if (!h->incremental) {
+            // Full → Incremental
+            h->incremental = true;
+            notify_menu_update(h, true);
         } else {
-            h->state = MSC_STATE_UPDATE_FAILED;
-            unmount_vfs(h);
-            notify_error(h, "Full update failed");
+            // Incremental → SD Clear
+            h->state = MSC_STATE_MENU_SD_CLEAR;
+            notify_event_simple(h, MSC_EVENT_MENU_SD_CLEAR_SELECTED);
         }
-    }
-}
-
-static void fsm_handle_menu_incremental(msc_handle_t h, const msc_internal_event_t *evt)
-{
-    if (evt->type != MSC_INTERNAL_INPUT_EVENT) {
-        return;
-    }
-
-    if (evt->input.event == INPUT_EVENT_ENCODER_ROTATE_CW) {
-        h->state = MSC_STATE_MENU_SD_CLEAR;
-        notify_event_simple(h, MSC_EVENT_MENU_SD_CLEAR_SELECTED);
     } else if (evt->input.event == INPUT_EVENT_ENCODER_ROTATE_CCW) {
-        h->state = MSC_STATE_MENU_UPDATE_FULL;
-        notify_event_simple(h, MSC_EVENT_MENU_FULL_SELECTED);
+        if (h->incremental) {
+            // Incremental → Full
+            h->incremental = false;
+            notify_menu_update(h, false);
+        } else {
+            // Full → SD Clear (wrap around)
+            h->state = MSC_STATE_MENU_SD_CLEAR;
+            notify_event_simple(h, MSC_EVENT_MENU_SD_CLEAR_SELECTED);
+        }
     } else if (evt->input.event == INPUT_EVENT_BUTTON_PRESS && evt->input.btn_num == 0) {
-        // Encoder switch press → launch incremental update
-        h->state = MSC_STATE_UPDATING_INCREMENTAL;
-        strncpy(h->current_filename, "Scanning...", sizeof(h->current_filename) - 1);
-        notify_progress(h);
+        // Encoder switch press → validate then update
 
-        esp_err_t ret = run_incremental_update(h);
-        drain_queue(h);
+        // Show analysis screen and yield to let display task render
+        notify_analysis(h, "Validating...");
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // Run validation synchronously
+        char err_msg[32];
+        esp_err_t ret = validate_usb_content(err_msg, sizeof(err_msg));
 
         if (ret == ESP_OK) {
-            h->state = MSC_STATE_UPDATE_DONE;
+            // Validation passed → run update directly
+            strncpy(h->current_filename, "Scanning...", sizeof(h->current_filename) - 1);
+            notify_progress(h);
+
+            ret = run_update(h, h->incremental);
+            drain_queue(h);
+
+            h->state = MSC_STATE_END;
             unmount_vfs(h);
-            notify_event_simple(h, MSC_EVENT_UPDATE_DONE);
+            if (ret == ESP_OK) {
+                notify_event_simple(h, MSC_EVENT_UPDATE_DONE);
+            } else {
+                notify_error(h, "Update failed");
+            }
         } else {
-            h->state = MSC_STATE_UPDATE_FAILED;
-            unmount_vfs(h);
-            notify_error(h, "Incremental update failed");
+            // Validation failed → ask user confirmation to sync anyway
+            drain_queue(h);
+            h->confirm_action = CONFIRM_ACTION_SYNC_BAD_DATA;
+            h->state = MSC_STATE_CONFIRM;
+            notify_confirm(h, "SYNC BAD DATA", err_msg, "Check serial log");
         }
     }
 }
@@ -737,49 +632,80 @@ static void fsm_handle_menu_sd_clear(msc_handle_t h, const msc_internal_event_t 
     }
 
     if (evt->input.event == INPUT_EVENT_ENCODER_ROTATE_CW) {
-        h->state = MSC_STATE_MENU_UPDATE_FULL;
-        notify_event_simple(h, MSC_EVENT_MENU_FULL_SELECTED);
+        // SD Clear → Full update
+        h->incremental = false;
+        h->state = MSC_STATE_MENU_UPDATE;
+        notify_menu_update(h, false);
     } else if (evt->input.event == INPUT_EVENT_ENCODER_ROTATE_CCW) {
-        h->state = MSC_STATE_MENU_UPDATE_INCREMENTAL;
-        notify_event_simple(h, MSC_EVENT_MENU_INCREMENTAL_SELECTED);
+        // SD Clear → Incremental
+        h->incremental = true;
+        h->state = MSC_STATE_MENU_UPDATE;
+        notify_menu_update(h, true);
     } else if (evt->input.event == INPUT_EVENT_BUTTON_PRESS && evt->input.btn_num == 0) {
         // Encoder switch press → ask for confirmation
-        h->state = MSC_STATE_MENU_SD_CLEAR_CONFIRM;
-        notify_event_simple(h, MSC_EVENT_MENU_SD_CLEAR_CONFIRM);
+        h->confirm_action = CONFIRM_ACTION_SD_CLEAR;
+        h->state = MSC_STATE_CONFIRM;
+        notify_confirm(h, "ERASE SDCARD", "All SD card data", "will be erased");
     }
 }
 
-static void fsm_handle_sd_clear_confirm(msc_handle_t h, const msc_internal_event_t *evt)
+static void fsm_handle_confirm(msc_handle_t h, const msc_internal_event_t *evt)
 {
     if (evt->type != MSC_INTERNAL_INPUT_EVENT) {
         return;
     }
 
-    // ignore long press and release events, just stay in confirmation state
+    // Ignore long press and release events, just stay in confirmation state
     if (evt->input.event != INPUT_EVENT_BUTTON_PRESS) {
         return;
     }
 
-    // "Red buttons" are buttons 7/8/9 (3rd row)
-    if( evt->input.btn_num >= 7 && evt->input.btn_num <= 9) {
-        h->state = MSC_STATE_UPDATING_SD_CLEAR;
-        strncpy(h->current_filename, "Erasing...", sizeof(h->current_filename) - 1);
-        notify_progress(h);
+    // "Red buttons" are buttons 7/8/9 (3rd row) → confirm
+    if (evt->input.btn_num >= 7 && evt->input.btn_num <= 9) {
+        switch (h->confirm_action) {
+            case CONFIRM_ACTION_SD_CLEAR: {
+                strncpy(h->current_filename, "Erasing...", sizeof(h->current_filename) - 1);
+                notify_progress(h);
 
-        esp_err_t ret = sd_card_erase_all(SDCARD_MOUNT_POINT);
-        drain_queue(h);
+                esp_err_t ret = sd_card_erase_all(SDCARD_MOUNT_POINT);
+                drain_queue(h);
 
-        if (ret == ESP_OK) {
-            h->state = MSC_STATE_UPDATE_DONE;
-            notify_event_simple(h, MSC_EVENT_UPDATE_DONE);
-        } else {
-            h->state = MSC_STATE_UPDATE_FAILED;
-            notify_error(h, "SD erase failed");
+                h->state = MSC_STATE_END;
+                if (ret == ESP_OK) {
+                    notify_event_simple(h, MSC_EVENT_UPDATE_DONE);
+                } else {
+                    notify_error(h, "SD erase failed");
+                }
+                break;
+            }
+            case CONFIRM_ACTION_SYNC_BAD_DATA: {
+                strncpy(h->current_filename, "Scanning...", sizeof(h->current_filename) - 1);
+                notify_progress(h);
+
+                esp_err_t ret = run_update(h, h->incremental);
+                drain_queue(h);
+                h->state = MSC_STATE_END;
+                unmount_vfs(h);
+                if (ret == ESP_OK) {
+                    notify_event_simple(h, MSC_EVENT_UPDATE_DONE);
+                } else {
+                    notify_error(h, "Update failed");
+                }
+                break;
+            }
         }
     } else {
-        // Any other input → back to SD clear menu
-        h->state = MSC_STATE_MENU_SD_CLEAR;
-        notify_event_simple(h, MSC_EVENT_MENU_SD_CLEAR_SELECTED);
+        // Any other button → cancel, return to appropriate menu
+        switch (h->confirm_action) {
+            case CONFIRM_ACTION_SD_CLEAR:
+                h->state = MSC_STATE_MENU_SD_CLEAR;
+                notify_event_simple(h, MSC_EVENT_MENU_SD_CLEAR_SELECTED);
+                break;
+            case CONFIRM_ACTION_SYNC_BAD_DATA:
+                h->state = MSC_STATE_MENU_UPDATE;
+                notify_menu_update(h, h->incremental);
+                break;
+        }
     }
 }
 
@@ -815,33 +741,23 @@ static void msc_fsm_task(void *arg)
                 }
                 break;
 
-            case MSC_STATE_MENU_UPDATE_FULL:
-                fsm_handle_menu_full(h, &evt);
-                break;
-
-            case MSC_STATE_MENU_UPDATE_INCREMENTAL:
-                fsm_handle_menu_incremental(h, &evt);
+            case MSC_STATE_MENU_UPDATE:
+                fsm_handle_menu_update(h, &evt);
                 break;
 
             case MSC_STATE_MENU_SD_CLEAR:
                 fsm_handle_menu_sd_clear(h, &evt);
                 break;
 
-            case MSC_STATE_MENU_SD_CLEAR_CONFIRM:
-                fsm_handle_sd_clear_confirm(h, &evt);
+            case MSC_STATE_CONFIRM:
+                fsm_handle_confirm(h, &evt);
                 break;
 
-            case MSC_STATE_UPDATE_DONE:
-            case MSC_STATE_UPDATE_FAILED:
+            case MSC_STATE_END:
                 // Terminal states: ignore all events (main handles reboot on disconnect)
                 break;
 
-            case MSC_STATE_INIT:
-            case MSC_STATE_UPDATING_FULL:
-            case MSC_STATE_UPDATING_INCREMENTAL:
-            case MSC_STATE_UPDATING_SD_CLEAR:
-                // These states run synchronously within handlers above,
-                // so we should not receive events in these states.
+            default:
                 ESP_LOGW(TAG, "FSM: unexpected event in state %d", h->state);
                 break;
         }
@@ -870,11 +786,8 @@ static void usb_lib_task(void *arg)
     }
 }
 
-/* ============================================================================
- * MSC Driver Event Callback (internal, static)
- * ============================================================================ */
-
-static void msc_driver_event_cb(const msc_host_event_t *event, void *arg)
+/** MSC class driver event callback (connect/disconnect → FSM queue) */
+static void msc_on_driver_event(const msc_host_event_t *event, void *arg)
 {
     msc_handle_t h = (msc_handle_t)arg;
     if (h == NULL) {
@@ -914,7 +827,7 @@ esp_err_t msc_init(const msc_config_t *config, msc_handle_t *handle)
         return ESP_ERR_INVALID_ARG;
     }
 
-    msc_handle_t h = calloc(1, sizeof(struct msc_s));
+    msc_handle_t h = heap_caps_calloc(1, sizeof(struct msc_s), MALLOC_CAP_INTERNAL);
     if (h == NULL) {
         ESP_LOGE(TAG, "Failed to allocate MSC handle");
         return ESP_ERR_NO_MEM;
@@ -928,7 +841,7 @@ esp_err_t msc_init(const msc_config_t *config, msc_handle_t *handle)
     h->event_queue = xQueueCreate(MSC_EVENT_QUEUE_DEPTH, sizeof(msc_internal_event_t));
     if (h->event_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create event queue");
-        free(h);
+        heap_caps_free(h);
         return ESP_ERR_NO_MEM;
     }
 
@@ -941,19 +854,20 @@ esp_err_t msc_init(const msc_config_t *config, msc_handle_t *handle)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to install USB host: %s", esp_err_to_name(ret));
         vQueueDelete(h->event_queue);
-        free(h);
+        heap_caps_free(h);
         return ret;
     }
     ESP_LOGI(TAG, "USB Host Library installed");
 
-    // Create USB host lib task (priority 5, core 0)
-    BaseType_t task_ret = xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096,
-                                                   NULL, 5, &h->usb_lib_task, 0);
-    if (task_ret != pdTRUE) {
+    BaseType_t task_ret = xTaskCreatePinnedToCore(usb_lib_task, "usb_lib",
+                                                   USB_LIB_TASK_STACK_SIZE,
+                                                   NULL, USB_LIB_TASK_PRIORITY,
+                                                   &h->usb_lib_task, USB_LIB_TASK_CORE);
+    if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create USB lib task");
         usb_host_uninstall();
         vQueueDelete(h->event_queue);
-        free(h);
+        heap_caps_free(h);
         return ESP_ERR_NO_MEM;
     }
 
@@ -963,7 +877,7 @@ esp_err_t msc_init(const msc_config_t *config, msc_handle_t *handle)
         .task_priority = 5,
         .stack_size = 4096,
         .core_id = 0,
-        .callback = msc_driver_event_cb,
+        .callback = msc_on_driver_event,
         .callback_arg = h,
     };
     ret = msc_host_install(&msc_config);
@@ -972,21 +886,22 @@ esp_err_t msc_init(const msc_config_t *config, msc_handle_t *handle)
         vTaskDelete(h->usb_lib_task);
         usb_host_uninstall();
         vQueueDelete(h->event_queue);
-        free(h);
+        heap_caps_free(h);
         return ret;
     }
     ESP_LOGI(TAG, "MSC host driver installed");
 
-    // Create FSM task (priority 2, core 0)
-    task_ret = xTaskCreatePinnedToCore(msc_fsm_task, "msc_fsm", 6144,
-                                        h, 2, &h->fsm_task, 0);
-    if (task_ret != pdTRUE) {
+    task_ret = xTaskCreatePinnedToCore(msc_fsm_task, "msc_fsm",
+                                        MSC_FSM_TASK_STACK_SIZE,
+                                        h, MSC_FSM_TASK_PRIORITY,
+                                        &h->fsm_task, MSC_FSM_TASK_CORE);
+    if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create FSM task");
         msc_host_uninstall();
         vTaskDelete(h->usb_lib_task);
         usb_host_uninstall();
         vQueueDelete(h->event_queue);
-        free(h);
+        heap_caps_free(h);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1018,12 +933,12 @@ esp_err_t msc_deinit(msc_handle_t handle)
         vQueueDelete(handle->event_queue);
     }
 
-    free(handle);
+    heap_caps_free(handle);
     ESP_LOGI(TAG, "MSC module deinitialized");
     return ESP_OK;
 }
 
-void msc_handle_input_event(msc_handle_t handle, uint8_t btn_num, input_event_type_t event)
+void msc_on_input_event(msc_handle_t handle, uint8_t btn_num, input_event_type_t event)
 {
     if (handle == NULL || handle->event_queue == NULL) {
         return;
@@ -1055,16 +970,10 @@ void msc_print_status(msc_handle_t handle, status_output_type_t output_type)
     const char *state_name = "unknown";
     switch (handle->state) {
         case MSC_STATE_WAIT_MSC: state_name = "WAIT_MSC"; break;
-        case MSC_STATE_INIT: state_name = "INIT"; break;
-        case MSC_STATE_MENU_UPDATE_FULL: state_name = "MENU_UPDATE_FULL"; break;
-        case MSC_STATE_MENU_UPDATE_INCREMENTAL: state_name = "MENU_UPDATE_INCREMENTAL"; break;
+        case MSC_STATE_MENU_UPDATE: state_name = handle->incremental ? "MENU_INCREMENTAL" : "MENU_FULL"; break;
         case MSC_STATE_MENU_SD_CLEAR: state_name = "MENU_SD_CLEAR"; break;
-        case MSC_STATE_MENU_SD_CLEAR_CONFIRM: state_name = "MENU_SD_CLEAR_CONFIRM"; break;
-        case MSC_STATE_UPDATING_FULL: state_name = "UPDATING_FULL"; break;
-        case MSC_STATE_UPDATING_INCREMENTAL: state_name = "UPDATING_INCREMENTAL"; break;
-        case MSC_STATE_UPDATING_SD_CLEAR: state_name = "UPDATING_SD_CLEAR"; break;
-        case MSC_STATE_UPDATE_DONE: state_name = "UPDATE_DONE"; break;
-        case MSC_STATE_UPDATE_FAILED: state_name = "UPDATE_FAILED"; break;
+        case MSC_STATE_CONFIRM: state_name = "CONFIRM"; break;
+        case MSC_STATE_END: state_name = "UPDATE_END"; break;
     }
 
     bool device_connected = (handle->device != NULL);
@@ -1083,8 +992,7 @@ void msc_print_status(msc_handle_t handle, status_output_type_t output_type)
             if (device_connected) {
                 printf("  Device address: %d\n", handle->device_address);
             }
-            if (handle->state >= MSC_STATE_UPDATING_FULL &&
-                handle->state <= MSC_STATE_UPDATING_SD_CLEAR) {
+            if (handle->total_files > 0) {
                 printf("  Progress: %d/%d files\n", handle->done_files, handle->total_files);
                 if (handle->current_filename[0] != '\0') {
                     printf("  Current file: %s\n", handle->current_filename);

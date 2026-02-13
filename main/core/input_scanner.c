@@ -6,6 +6,7 @@
 
 #include "input_scanner.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "rom/ets_sys.h"
 #include <inttypes.h>
@@ -430,7 +431,7 @@ esp_err_t input_scanner_init(const input_scanner_config_t *config, input_scanner
     }
 
     // Allocate handle
-    input_scanner_handle_t handle = (input_scanner_handle_t)calloc(1, sizeof(struct input_scanner_s));
+    input_scanner_handle_t handle = (input_scanner_handle_t)heap_caps_calloc(1, sizeof(struct input_scanner_s), MALLOC_CAP_INTERNAL);
     if (handle == NULL) {
         ESP_LOGE(TAG, "Failed to allocate scanner handle");
         return ESP_ERR_NO_MEM;
@@ -441,10 +442,10 @@ esp_err_t input_scanner_init(const input_scanner_config_t *config, input_scanner
 
     // Allocate button state array
     size_t num_buttons = (size_t)MATRIX_ROWS * MATRIX_COLS;
-    handle->button_states = (button_state_info_t *)calloc(num_buttons, sizeof(button_state_info_t));
+    handle->button_states = (button_state_info_t *)heap_caps_calloc(num_buttons, sizeof(button_state_info_t), MALLOC_CAP_INTERNAL);
     if (handle->button_states == NULL) {
         ESP_LOGE(TAG, "Failed to allocate button state array");
-        free(handle);
+        heap_caps_free(handle);
         return ESP_ERR_NO_MEM;
     }
 
@@ -558,7 +559,7 @@ esp_err_t input_scanner_init(const input_scanner_config_t *config, input_scanner
         handle->config.task_core_id
     );
 
-    if (task_ret != pdTRUE) {
+    if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create scanner task");
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
@@ -573,8 +574,8 @@ esp_err_t input_scanner_init(const input_scanner_config_t *config, input_scanner
     return ESP_OK;
 
 cleanup:
-    free(handle->button_states);
-    free(handle);
+    heap_caps_free(handle->button_states);
+    heap_caps_free(handle);
     return ret;
 }
 
@@ -602,10 +603,10 @@ esp_err_t input_scanner_deinit(input_scanner_handle_t handle)
     }
 
     // Free resources
-    free(handle->button_states);
+    heap_caps_free(handle->button_states);
 
     handle->initialized = false;
-    free(handle);
+    heap_caps_free(handle);
 
     ESP_LOGI(TAG, "Input scanner deinitialized");
 

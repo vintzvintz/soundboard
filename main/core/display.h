@@ -59,7 +59,6 @@ typedef struct {
  */
 esp_err_t display_init(const display_config_t *config, display_handle_t *display_handle);
 
-
 /**
  * @brief Deinitialize display module
  *
@@ -70,15 +69,6 @@ esp_err_t display_init(const display_config_t *config, display_handle_t *display
  *     - ESP_ERR_INVALID_STATE if display module not initialized
  */
 esp_err_t display_deinit(display_handle_t oled);
-
-
-/**
- * @brief Show startup layout
- *
- * Displays "Wait USB device".
- * Call this after display_init() and before USB device is detected.
- */
-void display_show_startup(display_handle_t oled);
 
 /**
  * @brief Show idle layout
@@ -162,12 +152,18 @@ void display_on_msc_analysis(display_handle_t oled, const char *status_msg);
 void display_on_msc_menu(display_handle_t oled, int selected_index);
 
 /**
- * @brief Show MSC SD card clear confirmation layout
+ * @brief Show MSC generic confirmation layout
  *
- * Displays warning screen asking user to press a bottom-row button (10-12)
- * to confirm destructive SD card erase, or any other button to cancel.
+ * Displays action title, message lines, and confirmation instructions.
+ * Used for SD card erase confirmation and bad-data sync confirmation.
+ *
+ * @param oled Display handle
+ * @param action Action title (8x16 font, max ~16 chars), e.g. "ERASE SDCARD"
+ * @param line1 First message line (6x8 font, max ~21 chars)
+ * @param line2 Second message line (6x8 font, max ~21 chars), can be NULL
  */
-void display_on_msc_sd_clear_confirm(display_handle_t oled);
+void display_on_msc_confirm(display_handle_t oled, const char *action,
+                            const char *line1, const char *line2);
 
 /**
  * @brief Show MSC progress layout

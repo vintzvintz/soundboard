@@ -4,16 +4,25 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h" // IWYU pragma: keep
+#include "soundboard.h"
 #include "provider.h"
+
+#ifdef CONFIG_SOUNDBOARD_IO_STATS_ENABLE
+    #include "benchmark.h"
+#endif
 
 static const char *TAG_PROVIDER = "audio_provider";
 static const char *TAG_CACHE = "audio_cache";
 
-#define CACHE_ENTRY_COUNT 16
+#define CACHE_ENTRY_COUNT 64
 #define WAV_CHUNK_SIZE 4096  // WAV read chunk size
-#define FILENAME_MAX_LENGTH 256
+
+// Maximum cacheable file size: files larger than half of total PSRAM are not cached
+// (they would cause excessive eviction and fragmentation)
+#define CACHE_ITEM_MAXSIZE (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 2)
 
 // Preload task configuration
 #define PRELOAD_TASK_PRIORITY    1   // Lower than player (2)
@@ -71,18 +80,15 @@ typedef struct cache_entry_s {
  * @brief Preload queue item
  */
 typedef struct {
-    char filename[FILENAME_MAX_LENGTH];
+    char filename[SOUNDBOARD_MAX_PATH_LEN];
 } preload_item_t;
-
-// Forward declaration for preload task
-static void preload_task(void *arg);
 
 /**
  * @brief Audio provider internal state
  */
 typedef struct audio_provider_s {
     // Cache management
-    cache_entry_t cache[CACHE_ENTRY_COUNT];   // Fixed-size array (16 entries)
+    cache_entry_t cache[CACHE_ENTRY_COUNT];
     size_t max_cache_bytes;                   // Total cache size limit (from config)
     size_t used_cache_bytes;                  // Current cache usage
 
@@ -106,7 +112,7 @@ typedef struct audio_provider_s {
  */
 struct audio_stream_s {
     // Stream metadata
-    char filename[FILENAME_MAX_LENGTH];  // Copied on open for safety
+    char filename[SOUNDBOARD_MAX_PATH_LEN];  // Copied on open for safety
     audio_info_t info;                   // Audio format parameters
     stream_type_t type;                  // WAV_FILE or CACHE
 
@@ -256,8 +262,9 @@ static esp_err_t parse_wav_header(FILE *fp, audio_info_t *info, uint32_t *data_o
 }
 
 
+
 // ============================================================================
-// Cache Management Helpers
+// Internal Cache Implementation
 // ============================================================================
 
 /**
@@ -279,7 +286,7 @@ static cache_entry_t* cache_lookup(audio_provider_state_t *provider, const char 
  *
  * @return Index of oldest unused entry, or -1 if all entries have ref_count > 0
  */
-static int find_lru_victim(audio_provider_state_t *provider)
+static int cache_find_lru_victim(audio_provider_state_t *provider)
 {
     int victim_idx = -1;
     uint32_t oldest_tick = UINT32_MAX;
@@ -336,149 +343,325 @@ static void free_cache_entry(audio_provider_state_t *provider, cache_entry_t *en
              provider->used_cache_bytes / 1024, provider->max_cache_bytes / 1024);
 }
 
-// ============================================================================
-// Public API Implementation
-// ============================================================================
-
-esp_err_t audio_provider_init(audio_provider_config_t *config, audio_provider_handle_t *provider)
+/**
+ * @brief Parse WAV file header to determine buffer size needed
+ *
+ * Opens and closes the file — caller will reopen for PCM data read.
+ */
+static esp_err_t cache_parse_wav_file(const char *filename, audio_info_t *info,
+                                       uint32_t *data_offset, size_t *total_bytes)
 {
-    if (!config || !provider) {
-        return ESP_ERR_INVALID_ARG;
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        ESP_LOGE(TAG_CACHE, "Failed to open file: %s", filename);
+        return ESP_ERR_NOT_FOUND;
     }
 
-    // Check PSRAM availability
-    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    if (psram_size == 0) {
-        ESP_LOGE(TAG_CACHE, "PSRAM not available - cache requires PSRAM");
-        return ESP_ERR_NOT_SUPPORTED;
+    uint32_t data_size;
+    esp_err_t ret = parse_wav_header(fp, info, data_offset, &data_size);
+    fclose(fp);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_CACHE, "Failed to parse WAV header: %s", filename);
+        return ret;
     }
 
-    // Allocate provider state in internal RAM
-    audio_provider_state_t *p = heap_caps_calloc(1, sizeof(audio_provider_state_t), MALLOC_CAP_8BIT);
-    if (!p) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Initialize cache mutex
-    p->cache_mutex = xSemaphoreCreateMutex();
-    if (!p->cache_mutex) {
-        free(p);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Initialize configuration
-    p->max_cache_bytes = config->cache_size_kb * 1024;
-    p->used_cache_bytes = 0;
-    p->initialized = true;
-
-    // Initialize all cache entries to empty
-    for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
-        p->cache[i].filename = NULL;
-        p->cache[i].buffer = NULL;
-        p->cache[i].ref_count = 0;
-        p->cache[i].mutex = xSemaphoreCreateMutex();
-        if (!p->cache[i].mutex) {
-            // Cleanup on failure
-            for (int j = 0; j < i; j++) {
-                vSemaphoreDelete(p->cache[j].mutex);
-            }
-            vSemaphoreDelete(p->cache_mutex);
-            free(p);
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    // Create preload queue
-    p->preload_queue = xQueueCreate(PRELOAD_QUEUE_LENGTH, sizeof(preload_item_t));
-    if (!p->preload_queue) {
-        for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
-            vSemaphoreDelete(p->cache[i].mutex);
-        }
-        vSemaphoreDelete(p->cache_mutex);
-        free(p);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // Initialize preload pause control
-    p->active_stream_count = 0;
-
-    // Create preload task (run on core 0 to avoid contention with player on core 1)
-    p->preload_task_running = true;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-        preload_task,
-        "preload",
-        PRELOAD_TASK_STACK_SIZE,
-        p,
-        PRELOAD_TASK_PRIORITY,
-        &p->preload_task_handle,
-        0  // Core 0
-    );
-
-    if (ret != pdPASS) {
-        vQueueDelete(p->preload_queue);
-        for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
-            vSemaphoreDelete(p->cache[i].mutex);
-        }
-        vSemaphoreDelete(p->cache_mutex);
-        free(p);
-        return ESP_ERR_NO_MEM;
-    }
-
-    ESP_LOGI(TAG_PROVIDER, "Audio provider initialized (cache: %zu KB, PSRAM: %zu KB available)",
-             p->max_cache_bytes / 1024, psram_size / 1024);
-
-    *provider = p;
+    *total_bytes = (size_t)info->total_frames * info->channels * sizeof(int16_t);
     return ESP_OK;
 }
 
-void audio_provider_deinit(audio_provider_handle_t provider)
+/**
+ * @brief Reserve a cache slot and allocate PSRAM buffer, evicting LRU entries until malloc succeeds
+ *
+ * Combines slot reservation and PSRAM allocation in a single eviction loop.
+ * This handles heap fragmentation: even if used_cache_bytes says there's enough
+ * room, the actual malloc may fail due to non-contiguous free blocks. By evicting
+ * one entry at a time and retrying malloc, we consolidate free memory.
+ *
+ * Caller must hold NO mutex. This function acquires cache_mutex internally.
+ */
+static esp_err_t cache_reserve_and_alloc(audio_provider_state_t *provider, size_t total_bytes,
+                                          int *out_slot, int16_t **out_buffer)
 {
-    if (!provider) {
-        return;
-    }
+    xSemaphoreTake(provider->cache_mutex, portMAX_DELAY);
 
-    // Stop preload task
-    if (provider->preload_task_running) {
-        provider->preload_task_running = false;
+    int slot = -1;
+    int16_t *buffer = NULL;
 
-        // Send empty filename as sentinel to wake up task
-        preload_item_t sentinel = { .filename = "" };
-        xQueueSend(provider->preload_queue, &sentinel, pdMS_TO_TICKS(100));
-
-        // Wait for task to exit (max 500ms)
-        for (int i = 0; i < 50 && provider->preload_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-
-    // Delete preload queue
-    if (provider->preload_queue) {
-        vQueueDelete(provider->preload_queue);
-    }
-
-    // Free all cache entries
-    for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
-        if (provider->cache[i].filename != NULL) {
-            // Warn if entry still in use
-            if (provider->cache[i].ref_count > 0) {
-                ESP_LOGW(TAG_CACHE, "Freeing cache entry with active streams: %s",
-                         provider->cache[i].filename);
+    while (true) {
+        // Find an empty slot
+        if (slot < 0) {
+            for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
+                if (provider->cache[i].filename == NULL) {
+                    slot = i;
+                    break;
+                }
             }
-            free_cache_entry(provider, &provider->cache[i]);
         }
-        vSemaphoreDelete(provider->cache[i].mutex);
+
+        // Check memory budget first
+        if (slot >= 0 && provider->used_cache_bytes + total_bytes <= provider->max_cache_bytes) {
+            // Budget OK — try actual allocation (may fail due to fragmentation)
+            buffer = heap_caps_malloc(total_bytes, MALLOC_CAP_SPIRAM);
+            if (buffer != NULL) {
+                break;  // Success: have slot, budget, and buffer
+            }
+            ESP_LOGD(TAG_CACHE, "PSRAM fragmented, evicting to defragment (%zu KB requested)", total_bytes / 1024);
+        }
+
+        // Need to evict: no slot, budget exceeded, or malloc failed despite budget
+        int victim = cache_find_lru_victim(provider);
+        if (victim < 0) {
+            xSemaphoreGive(provider->cache_mutex);
+            ESP_LOGW(TAG_CACHE, "Cannot allocate %zu KB: no evictable entries", total_bytes / 1024);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG_CACHE, "Evicting LRU entry: %s (%zu KB)",
+                 provider->cache[victim].filename, provider->cache[victim].buf_size / 1024);
+        free_cache_entry(provider, &provider->cache[victim]);
+
+        if (slot < 0) {
+            slot = victim;
+        }
     }
 
-    vSemaphoreDelete(provider->cache_mutex);
-    free(provider);
+    // Reserve memory budget
+    provider->used_cache_bytes += total_bytes;
 
-    ESP_LOGI(TAG_PROVIDER, "Audio provider deinitialized");
+    xSemaphoreGive(provider->cache_mutex);
+
+    *out_slot = slot;
+    *out_buffer = buffer;
+    return ESP_OK;
+}
+
+/**
+ * @brief Read PCM data from file into a pre-allocated buffer
+ *
+ * Pause-aware: blocks during active playback to yield SD bandwidth.
+ */
+static esp_err_t cache_read_pcm_data(audio_provider_state_t *provider, const char *filename,
+                                      uint32_t data_offset, size_t total_bytes, int16_t *buffer)
+{
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        ESP_LOGE(TAG_CACHE, "Failed to reopen file: %s", filename);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    fseek(fp, data_offset, SEEK_SET);
+    size_t total_read = 0;
+    while (total_read < total_bytes) {
+        // Block if playback is active (yield SD card bandwidth to player task)
+        while (provider->active_stream_count > 0) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+
+        size_t to_read = total_bytes - total_read;
+        if (to_read > WAV_CHUNK_SIZE) {
+            to_read = WAV_CHUNK_SIZE;
+        }
+
+#ifdef IO_STATS_ENABLE
+        int64_t t0 = benchmark_start();
+#endif
+        size_t n = fread((uint8_t*)buffer + total_read, 1, to_read, fp);
+#ifdef IO_STATS_ENABLE
+        benchmark_record(BENCH_CACHE_LOAD, t0, n);
+#endif
+        if (n == 0) {
+            break;
+        }
+        total_read += n;
+    }
+
+    fclose(fp);
+#ifdef IO_STATS_ENABLE
+    // Log benchmark data
+    benchmark_log_and_reset(BENCH_CACHE_LOAD, filename);
+#endif
+
+    if (total_read != total_bytes) {
+        ESP_LOGE(TAG_CACHE, "Failed to read entire file: read %zu/%zu bytes", total_read, total_bytes);
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+/**
+ * @brief Store entry metadata in a previously reserved cache slot
+ *
+ * Acquires cache_mutex internally. Slot must already be reserved with budget accounted for.
+ */
+static void cache_store_entry(audio_provider_state_t *provider, int slot, const char *filename,
+                               const audio_info_t *info, int16_t *buffer, size_t total_bytes)
+{
+    xSemaphoreTake(provider->cache_mutex, portMAX_DELAY);
+
+    cache_entry_t *entry = &provider->cache[slot];
+    entry->filename = strdup(filename);
+    entry->frame_count = info->total_frames;
+    memcpy(&entry->info, info, sizeof(audio_info_t));
+    entry->buf_size = total_bytes;
+    entry->total_samples = (size_t)info->total_frames * info->channels;
+    entry->buffer = buffer;
+    entry->ref_count = 0;
+    entry->last_access_tick = xTaskGetTickCount();
+
+    ESP_LOGI(TAG_CACHE, "Cached file: %s (%zu KB, %u Hz, %u ch) - cache usage: %zu/%zu KB",
+             filename, total_bytes / 1024, info->frame_rate, info->channels,
+             provider->used_cache_bytes / 1024, provider->max_cache_bytes / 1024);
+
+    xSemaphoreGive(provider->cache_mutex);
+}
+
+/**
+ * @brief Cache a file into PSRAM
+ *
+ * Only called from preload task (single writer). Evicts LRU entries before
+ * allocating the buffer to minimize peak PSRAM usage.
+ */
+static esp_err_t cache_file_internal(audio_provider_state_t *provider, const char *filename)
+{
+    if (!provider || !filename) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Check if already cached
+    xSemaphoreTake(provider->cache_mutex, portMAX_DELAY);
+    if (cache_lookup(provider, filename) != NULL) {
+        ESP_LOGD(TAG_CACHE, "File already cached: %s", filename);
+        xSemaphoreGive(provider->cache_mutex);
+        return ESP_OK;
+    }
+    xSemaphoreGive(provider->cache_mutex);
+
+    // Parse WAV header to determine buffer size needed
+    audio_info_t info;
+    uint32_t data_offset;
+    size_t total_bytes;
+    esp_err_t ret = cache_parse_wav_file(filename, &info, &data_offset, &total_bytes);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Reject files too large to cache (avoids excessive eviction and fragmentation)
+    if (total_bytes > CACHE_ITEM_MAXSIZE) {
+        ESP_LOGW(TAG_CACHE, "File too large to cache: %s (%zu KB, max %zu KB)",
+                 filename, total_bytes / 1024, (size_t)CACHE_ITEM_MAXSIZE / 1024);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Reserve slot + allocate PSRAM buffer (evicts LRU entries until malloc succeeds)
+    int slot;
+    int16_t *buffer;
+    ret = cache_reserve_and_alloc(provider, total_bytes, &slot, &buffer);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Read PCM data into allocated buffer (no mutex — slow I/O)
+    ret = cache_read_pcm_data(provider, filename, data_offset, total_bytes, buffer);
+    if (ret != ESP_OK) {
+        // Unreserve: give back the memory budget and free buffer
+        heap_caps_free(buffer);
+        xSemaphoreTake(provider->cache_mutex, portMAX_DELAY);
+        provider->used_cache_bytes -= total_bytes;
+        xSemaphoreGive(provider->cache_mutex);
+        return ret;
+    }
+
+    // Store entry in reserved slot
+    cache_store_entry(provider, slot, filename, &info, buffer, total_bytes);
+    return ESP_OK;
 }
 
 // ============================================================================
-// Stream Operations
+// Preload Task
 // ============================================================================
 
+/**
+ * @brief Background preload task
+ *
+ * Processes filenames from preload queue and caches them.
+ * Runs at low priority to avoid interfering with playback.
+ */
+static void cache_task(void *arg)
+{
+    audio_provider_state_t *provider = (audio_provider_state_t *)arg;
+    preload_item_t item;
+
+    ESP_LOGI(TAG_CACHE, "Preload task started");
+
+    while (provider->preload_task_running) {
+        // Block waiting for items (100ms timeout to check shutdown flag)
+        if (xQueueReceive(provider->preload_queue, &item, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // Empty filename is sentinel for shutdown
+            if (item.filename[0] == '\0') {
+                break;
+            }
+
+            ESP_LOGD(TAG_CACHE, "Preloading: %s", item.filename);
+            esp_err_t ret = cache_file_internal(provider, item.filename);
+            if (ret != ESP_OK && ret != ESP_ERR_NO_MEM) {
+                ESP_LOGW(TAG_CACHE, "Failed to preload %s: %s", item.filename, esp_err_to_name(ret));
+            }
+        }
+    }
+
+    ESP_LOGI(TAG_CACHE, "Preload task exiting");
+    vTaskDelete(NULL);
+}
+
+esp_err_t audio_provider_preload(audio_provider_handle_t provider, const char *filename)
+{
+    if (!provider || !filename) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!provider->preload_queue) {
+        ESP_LOGW(TAG_CACHE, "Preload queue not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Prepare queue item
+    preload_item_t item;
+    strncpy(item.filename, filename, SOUNDBOARD_MAX_PATH_LEN - 1);
+    item.filename[SOUNDBOARD_MAX_PATH_LEN - 1] = '\0';
+
+    // Non-blocking queue send (drop if full)
+    if (xQueueSend(provider->preload_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG_CACHE, "Preload queue full, dropping: %s", filename);
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGD(TAG_CACHE, "Queued for preload: %s", filename);
+    return ESP_OK;
+}
+
+void audio_provider_flush_preload_queue(audio_provider_handle_t provider)
+{
+    if (!provider || !provider->preload_queue) {
+        return;
+    }
+
+    preload_item_t item;
+    int flushed = 0;
+    while (xQueueReceive(provider->preload_queue, &item, 0) == pdTRUE) {
+        flushed++;
+    }
+
+    if (flushed > 0) {
+        ESP_LOGI(TAG_CACHE, "Flushed %d items from preload queue", flushed);
+    }
+}
+
+
+
+// ============================================================================
+// Public API Implementation
+// ============================================================================
 esp_err_t audio_provider_open_stream(audio_provider_handle_t provider,
                                       const char *filename,
                                       audio_stream_handle_t *stream)
@@ -515,8 +698,8 @@ esp_err_t audio_provider_open_stream(audio_provider_handle_t provider,
         }
 
         // Initialize cache stream
-        strncpy(s->filename, filename, FILENAME_MAX_LENGTH - 1);
-        s->filename[FILENAME_MAX_LENGTH - 1] = '\0';
+        strncpy(s->filename, filename, SOUNDBOARD_MAX_PATH_LEN - 1);
+        s->filename[SOUNDBOARD_MAX_PATH_LEN - 1] = '\0';
         memcpy(&s->info, &entry->info, sizeof(audio_info_t));
         s->type = STREAM_TYPE_CACHE;
         s->provider = provider;
@@ -558,8 +741,8 @@ esp_err_t audio_provider_open_stream(audio_provider_handle_t provider,
     }
 
     // Initialize WAV stream
-    strncpy(s->filename, filename, FILENAME_MAX_LENGTH - 1);
-    s->filename[FILENAME_MAX_LENGTH - 1] = '\0';
+    strncpy(s->filename, filename, SOUNDBOARD_MAX_PATH_LEN - 1);
+    s->filename[SOUNDBOARD_MAX_PATH_LEN - 1] = '\0';
     memcpy(&s->info, &info, sizeof(audio_info_t));
     s->type = STREAM_TYPE_WAV_FILE;
     s->provider = provider;
@@ -616,8 +799,14 @@ esp_err_t audio_provider_read_stream(audio_stream_handle_t stream,
         size_t to_read = (buffer_samples < remaining) ? buffer_samples : remaining;
 
         // Copy from PSRAM buffer
-        memcpy(buffer, entry->buffer + stream->cache.position, to_read * sizeof(int16_t));
-
+        size_t bytes_to_read = to_read * sizeof(int16_t);
+#ifdef IO_STATS_ENABLE        
+        int64_t t0 = benchmark_start();
+#endif
+        memcpy(buffer, entry->buffer + stream->cache.position, bytes_to_read );
+#ifdef IO_STATS_ENABLE
+        benchmark_record(BENCH_CACHE_HIT, t0, bytes_to_read);
+#endif
         stream->cache.position += to_read;
         *samples_read = to_read;
 
@@ -645,7 +834,13 @@ esp_err_t audio_provider_read_stream(audio_stream_handle_t stream,
         bytes_to_read = WAV_CHUNK_SIZE;
     }
 
+#ifdef IO_STATS_ENABLE
+    int64_t t0 = benchmark_start();
+#endif
     size_t bytes_read = fread(buffer, 1, bytes_to_read, stream->wav.fp);
+#ifdef IO_STATS_ENABLE
+    benchmark_record(BENCH_SD_READ, t0, bytes_read);
+#endif
     if (bytes_read == 0) {
         if (feof(stream->wav.fp)) {
             stream->eof_reached = true;
@@ -677,6 +872,10 @@ esp_err_t audio_provider_close_stream(audio_stream_handle_t stream)
         }
         xSemaphoreGive(entry->mutex);
 
+#ifdef IO_STATS_ENABLE
+        // Log benchmark data
+        benchmark_log_and_reset(BENCH_CACHE_HIT, stream->filename);
+#endif
     } else if (stream->type == STREAM_TYPE_WAV_FILE) {
         // Close file handle
         if (stream->wav.fp != NULL) {
@@ -684,6 +883,10 @@ esp_err_t audio_provider_close_stream(audio_stream_handle_t stream)
             stream->wav.fp = NULL;
         }
 
+#ifdef IO_STATS_ENABLE
+        // Log benchmark data
+        benchmark_log_and_reset(BENCH_SD_READ, stream->filename);
+#endif
         // Resume preload task if this was the last active WAV file stream
         audio_provider_state_t *provider = stream->provider;
         int new_count = __atomic_sub_fetch(&provider->active_stream_count, 1, __ATOMIC_SEQ_CST);
@@ -695,7 +898,7 @@ esp_err_t audio_provider_close_stream(audio_stream_handle_t stream)
     }
 
     // Free stream structure
-    free(stream);
+    heap_caps_free(stream);
 
     return ESP_OK;
 }
@@ -729,250 +932,141 @@ uint16_t audio_provider_get_stream_progress(audio_stream_handle_t stream)
     return (uint16_t)((uint64_t)stream->wav.bytes_read * UINT16_MAX / total);
 }
 
-// ============================================================================
-// Internal Cache Implementation
-// ============================================================================
-
-/**
- * @brief Internal function to cache a file
- *
- * Thread-safe: releases mutex during file I/O to avoid blocking playback.
- * Re-checks cache state after file read to handle race conditions.
- */
-static esp_err_t cache_file_internal(audio_provider_state_t *provider, const char *filename)
+esp_err_t audio_provider_init(audio_provider_config_t *config, audio_provider_handle_t *provider)
 {
-    if (!provider || !filename) {
+    if (!config || !provider) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Phase 1: Check if already cached (quick check with mutex)
-    xSemaphoreTake(provider->cache_mutex, portMAX_DELAY);
-    cache_entry_t *entry = cache_lookup(provider, filename);
-    if (entry != NULL) {
-        ESP_LOGD(TAG_CACHE, "File already cached: %s", filename);
-        xSemaphoreGive(provider->cache_mutex);
-        return ESP_OK;
-    }
-    xSemaphoreGive(provider->cache_mutex);
-
-    // Phase 2: Open and parse file (WITHOUT mutex - allows concurrent playback)
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        ESP_LOGE(TAG_CACHE, "Failed to open file: %s", filename);
-        return ESP_ERR_NOT_FOUND;
+    // Check PSRAM availability
+    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    if (psram_size == 0) {
+        ESP_LOGE(TAG_CACHE, "PSRAM not available - cache requires PSRAM");
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
-    audio_info_t info;
-    uint32_t data_offset;
-    uint32_t data_size;
-    esp_err_t ret = parse_wav_header(fp, &info, &data_offset, &data_size);
-    if (ret != ESP_OK) {
-        fclose(fp);
-        ESP_LOGE(TAG_CACHE, "Failed to parse WAV header: %s", filename);
-        return ret;
-    }
-
-    // Calculate buffer size
-    size_t total_bytes = (size_t)info.total_frames * info.channels * sizeof(int16_t);
-
-    // Allocate PSRAM buffer (WITHOUT mutex)
-    int16_t *buffer = heap_caps_malloc(total_bytes, MALLOC_CAP_SPIRAM);
-    if (!buffer) {
-        fclose(fp);
-        ESP_LOGE(TAG_CACHE, "Failed to allocate PSRAM buffer (%zu KB)", total_bytes / 1024);
+    // Allocate provider state in internal RAM
+    audio_provider_state_t *p = heap_caps_calloc(1, sizeof(audio_provider_state_t), MALLOC_CAP_8BIT);
+    if (!p) {
         return ESP_ERR_NO_MEM;
     }
 
-    // Read entire file into buffer (WITHOUT mutex - this is the slow part)
-    // Pause-aware: check before each chunk read if playback is active
-    fseek(fp, data_offset, SEEK_SET);
-    size_t total_read = 0;
-    while (total_read < total_bytes) {
-        // Block if playback is active (wait for task notification to resume)
-        // This yields SD card bandwidth to the player task
-        while (provider->active_stream_count > 0) {
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // Block until notified
-        }
-
-        size_t to_read = total_bytes - total_read;
-        if (to_read > WAV_CHUNK_SIZE) {
-            to_read = WAV_CHUNK_SIZE;
-        }
-
-        size_t n = fread((uint8_t*)buffer + total_read, 1, to_read, fp);
-        if (n == 0) {
-            break;
-        }
-        total_read += n;
+    // Initialize cache mutex
+    p->cache_mutex = xSemaphoreCreateMutex();
+    if (!p->cache_mutex) {
+        heap_caps_free(p);
+        return ESP_ERR_NO_MEM;
     }
 
-    fclose(fp);
+    // Initialize configuration
+    p->max_cache_bytes = config->cache_size_kb * 1024;
+    p->used_cache_bytes = 0;
+    p->initialized = true;
 
-    if (total_read != total_bytes) {
-        heap_caps_free(buffer);
-        ESP_LOGE(TAG_CACHE, "Failed to read entire file: read %zu/%zu bytes", total_read, total_bytes);
-        return ESP_FAIL;
-    }
-
-    // Phase 3: Insert into cache (WITH mutex - quick operation)
-    xSemaphoreTake(provider->cache_mutex, portMAX_DELAY);
-
-    // Re-check if another task cached this file while we were reading
-    entry = cache_lookup(provider, filename);
-    if (entry != NULL) {
-        ESP_LOGD(TAG_CACHE, "File cached by another task while reading: %s", filename);
-        heap_caps_free(buffer);
-        xSemaphoreGive(provider->cache_mutex);
-        return ESP_OK;
-    }
-
-    // Find empty slot, evicting LRU entries as needed
-    // Two reasons to evict: (1) memory limit exceeded, or (2) no empty slots
-    int slot = -1;
-    while (true) {
-        // First, check for an empty slot
-        if (slot < 0) {
-            for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
-                if (provider->cache[i].filename == NULL) {
-                    slot = i;
-                    break;
-                }
+    // Initialize all cache entries to empty
+    for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
+        p->cache[i].filename = NULL;
+        p->cache[i].buffer = NULL;
+        p->cache[i].ref_count = 0;
+        p->cache[i].mutex = xSemaphoreCreateMutex();
+        if (!p->cache[i].mutex) {
+            // Cleanup on failure
+            for (int j = 0; j < i; j++) {
+                vSemaphoreDelete(p->cache[j].mutex);
             }
-        }
-
-        // Check if we have both a slot AND enough memory
-        if (slot >= 0 && provider->used_cache_bytes + total_bytes <= provider->max_cache_bytes) {
-            break;  // Have slot and memory - proceed
-        }
-
-        // Need to evict: either no slot available, or memory limit exceeded
-        int victim = find_lru_victim(provider);
-        if (victim < 0) {
-            heap_caps_free(buffer);
-            xSemaphoreGive(provider->cache_mutex);
-            ESP_LOGW(TAG_CACHE, "Cache full (all entries in use), cannot preload: %s", filename);
+            vSemaphoreDelete(p->cache_mutex);
+            heap_caps_free(p);
             return ESP_ERR_NO_MEM;
         }
-        ESP_LOGI(TAG_CACHE, "Evicting LRU entry: %s", provider->cache[victim].filename);
-        free_cache_entry(provider, &provider->cache[victim]);
-
-        // After eviction, the victim slot is now empty - use it if we didn't have a slot
-        if (slot < 0) {
-            slot = victim;
-        }
-        // Continue loop to check memory limit again
     }
 
-    // Store in cache
-    cache_entry_t *new_entry = &provider->cache[slot];
-    new_entry->filename = strdup(filename);
-    if (!new_entry->filename) {
-        heap_caps_free(buffer);
-        xSemaphoreGive(provider->cache_mutex);
+    // Create preload queue
+    p->preload_queue = xQueueCreate(PRELOAD_QUEUE_LENGTH, sizeof(preload_item_t));
+    if (!p->preload_queue) {
+        for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
+            vSemaphoreDelete(p->cache[i].mutex);
+        }
+        vSemaphoreDelete(p->cache_mutex);
+        heap_caps_free(p);
         return ESP_ERR_NO_MEM;
     }
 
-    new_entry->frame_count = info.total_frames;
-    memcpy(&new_entry->info, &info, sizeof(audio_info_t));
-    new_entry->buf_size = total_bytes;
-    new_entry->total_samples = (size_t)info.total_frames * info.channels;
-    new_entry->buffer = buffer;
-    new_entry->ref_count = 0;
-    new_entry->last_access_tick = xTaskGetTickCount();
+    // Initialize preload pause control
+    p->active_stream_count = 0;
 
-    provider->used_cache_bytes += total_bytes;
+    // Create preload task (run on core 0 to avoid contention with player on core 1)
+    p->preload_task_running = true;
+    BaseType_t ret = xTaskCreatePinnedToCore(
+        cache_task,
+        "cache",
+        PRELOAD_TASK_STACK_SIZE,
+        p,
+        PRELOAD_TASK_PRIORITY,
+        &p->preload_task_handle,
+        0  // Core 0
+    );
 
-    ESP_LOGI(TAG_CACHE, "Cached file: %s (%zu KB, %u Hz, %u ch) - cache usage: %zu/%zu KB",
-             filename, total_bytes / 1024, info.frame_rate, info.channels,
-             provider->used_cache_bytes / 1024, provider->max_cache_bytes / 1024);
-
-    xSemaphoreGive(provider->cache_mutex);
-    return ESP_OK;
-}
-
-// ============================================================================
-// Preload Task
-// ============================================================================
-
-/**
- * @brief Background preload task
- *
- * Processes filenames from preload queue and caches them.
- * Runs at low priority to avoid interfering with playback.
- */
-static void preload_task(void *arg)
-{
-    audio_provider_state_t *provider = (audio_provider_state_t *)arg;
-    preload_item_t item;
-
-    ESP_LOGI(TAG_CACHE, "Preload task started");
-
-    while (provider->preload_task_running) {
-        // Block waiting for items (100ms timeout to check shutdown flag)
-        if (xQueueReceive(provider->preload_queue, &item, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // Empty filename is sentinel for shutdown
-            if (item.filename[0] == '\0') {
-                break;
-            }
-
-            ESP_LOGD(TAG_CACHE, "Preloading: %s", item.filename);
-            esp_err_t ret = cache_file_internal(provider, item.filename);
-            if (ret != ESP_OK && ret != ESP_ERR_NO_MEM) {
-                ESP_LOGW(TAG_CACHE, "Failed to preload %s: %s", item.filename, esp_err_to_name(ret));
-            }
+    if (ret != pdPASS) {
+        vQueueDelete(p->preload_queue);
+        for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
+            vSemaphoreDelete(p->cache[i].mutex);
         }
-    }
-
-    ESP_LOGI(TAG_CACHE, "Preload task exiting");
-    vTaskDelete(NULL);
-}
-
-// ============================================================================
-// Public Preload API
-// ============================================================================
-
-esp_err_t audio_provider_preload(audio_provider_handle_t provider, const char *filename)
-{
-    if (!provider || !filename) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (!provider->preload_queue) {
-        ESP_LOGW(TAG_CACHE, "Preload queue not initialized");
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    // Prepare queue item
-    preload_item_t item;
-    strncpy(item.filename, filename, FILENAME_MAX_LENGTH - 1);
-    item.filename[FILENAME_MAX_LENGTH - 1] = '\0';
-
-    // Non-blocking queue send (drop if full)
-    if (xQueueSend(provider->preload_queue, &item, 0) != pdTRUE) {
-        ESP_LOGW(TAG_CACHE, "Preload queue full, dropping: %s", filename);
+        vSemaphoreDelete(p->cache_mutex);
+        heap_caps_free(p);
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGD(TAG_CACHE, "Queued for preload: %s", filename);
+    ESP_LOGI(TAG_PROVIDER, "Audio provider initialized (cache: %zu KB, PSRAM: %zu KB available)",
+             p->max_cache_bytes / 1024, psram_size / 1024);
+
+    *provider = p;
     return ESP_OK;
 }
 
-void audio_provider_flush_preload_queue(audio_provider_handle_t provider)
+void audio_provider_deinit(audio_provider_handle_t provider)
 {
-    if (!provider || !provider->preload_queue) {
+    if (!provider) {
         return;
     }
 
-    preload_item_t item;
-    int flushed = 0;
-    while (xQueueReceive(provider->preload_queue, &item, 0) == pdTRUE) {
-        flushed++;
+    // Stop preload task
+    if (provider->preload_task_running) {
+        provider->preload_task_running = false;
+
+        // Send empty filename as sentinel to wake up task
+        preload_item_t sentinel = { .filename = "" };
+        xQueueSend(provider->preload_queue, &sentinel, pdMS_TO_TICKS(100));
+
+        // Wait for task to exit (max 500ms)
+        for (int i = 0; i < 50 && provider->preload_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 
-    if (flushed > 0) {
-        ESP_LOGI(TAG_CACHE, "Flushed %d items from preload queue", flushed);
+    // Delete preload queue
+    if (provider->preload_queue) {
+        vQueueDelete(provider->preload_queue);
     }
+
+    // Free all cache entries
+    for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
+        if (provider->cache[i].filename != NULL) {
+            // Warn if entry still in use
+            if (provider->cache[i].ref_count > 0) {
+                ESP_LOGW(TAG_CACHE, "Freeing cache entry with active streams: %s",
+                         provider->cache[i].filename);
+            }
+            free_cache_entry(provider, &provider->cache[i]);
+        }
+        vSemaphoreDelete(provider->cache[i].mutex);
+    }
+
+    vSemaphoreDelete(provider->cache_mutex);
+    heap_caps_free(provider);
+
+    ESP_LOGI(TAG_PROVIDER, "Audio provider deinitialized");
 }
+
 
 void audio_provider_print_status(audio_provider_handle_t provider, status_output_type_t output_type)
 {
@@ -989,14 +1083,12 @@ void audio_provider_print_status(audio_provider_handle_t provider, status_output
     // Count used slots and calculate stats
     int slots_used = 0;
     size_t total_cached_bytes = 0;
-    //int active_refs = 0;
 
     xSemaphoreTake(provider->cache_mutex, portMAX_DELAY);
     for (int i = 0; i < CACHE_ENTRY_COUNT; i++) {
         if (provider->cache[i].filename != NULL) {
             slots_used++;
             total_cached_bytes += provider->cache[i].buf_size;
-            //active_refs += provider->cache[i].ref_count;
         }
     }
     size_t max_cache = provider->max_cache_bytes;

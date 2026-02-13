@@ -32,11 +32,10 @@ typedef struct msc_s *msc_handle_t;
  * @brief MSC event types (sent to main app via callback)
  */
 typedef enum {
-    MSC_EVENT_READY,                     /**< INIT done, menu is active */
-    MSC_EVENT_MENU_FULL_SELECTED,        /**< Menu: "Full update" highlighted */
-    MSC_EVENT_MENU_INCREMENTAL_SELECTED, /**< Menu: "Incremental update" highlighted */
+    MSC_EVENT_ANALYSIS,                  /**< Show analysis screen (with status message) */
+    MSC_EVENT_MENU_UPDATE_SELECTED,      /**< Menu: update option highlighted (see menu.incremental) */
     MSC_EVENT_MENU_SD_CLEAR_SELECTED,    /**< Menu: "Clear SD card" highlighted */
-    MSC_EVENT_MENU_SD_CLEAR_CONFIRM,     /**< Awaiting red-button confirmation */
+    MSC_EVENT_CONFIRM,                   /**< Awaiting user confirmation (with action + message) */
     MSC_EVENT_UPDATING,                  /**< Update in progress (with progress data) */
     MSC_EVENT_UPDATE_DONE,               /**< Update completed successfully */
     MSC_EVENT_UPDATE_FAILED,             /**< Update failed (with error message) */
@@ -48,6 +47,17 @@ typedef enum {
 typedef struct {
     msc_event_type_t type;
     union {
+        struct {
+            const char *status_msg;      /**< Analysis status message */
+        } analysis;
+        struct {
+            bool incremental;            /**< true=incremental, false=full */
+        } menu;
+        struct {
+            const char *action;          /**< Confirmation title (e.g., "ERASE SDCARD") */
+            const char *line1;           /**< Message line 1 */
+            const char *line2;           /**< Message line 2 (can be NULL) */
+        } confirm;
         struct {
             const char *filename;        /**< Current file being copied */
             uint16_t progress;           /**< 0 = start, UINT16_MAX = complete */
@@ -121,7 +131,7 @@ esp_err_t msc_deinit(msc_handle_t handle);
  * @param btn_num Button number (0=encoder switch, 1-12=matrix buttons)
  * @param event Input event type
  */
-void msc_handle_input_event(msc_handle_t handle, uint8_t btn_num, input_event_type_t event);
+void msc_on_input_event(msc_handle_t handle, uint8_t btn_num, input_event_type_t event);
 
 /**
  * @brief Print MSC module status information to console

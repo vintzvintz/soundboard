@@ -11,10 +11,16 @@
 
 #pragma once
 
+#include "esp_vfs.h"  // IWYU pragma: keep (ESP_VFS_PATH_MAX)
+#include "ff.h"       // IWYU pragma: keep (FF_LFN_BUF)
+
 // Storage mountpoint defines (used in main.c, console.c, msc.c)
 #define SPIFFS_MOUNT_POINT "/spiffs"
 #define SDCARD_MOUNT_POINT "/sdcard"
 #define MSC_MOUNT_POINT    "/msc"
+
+// Maximum full path length: mount point + "/" + longest LFN + NUL
+#define SOUNDBOARD_MAX_PATH_LEN (ESP_VFS_PATH_MAX + 1 + FF_LFN_BUF + 1)
 
 /**
  * @brief Application mode enumeration
